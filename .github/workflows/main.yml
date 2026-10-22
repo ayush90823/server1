@@ -1,0 +1,42 @@
+name: run-bot
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: run-bot
+  cancel-in-progress: true
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install requirements
+        run: pip install -r requirements.txt
+
+      - name: Install cloudflared
+        run: |
+          curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
+          chmod +x cloudflared
+          sudo mv cloudflared /usr/local/bin/
+
+      - name: Start bot
+        run: bash start.sh
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+          STORAGE_CHANNEL: ${{ secrets.STORAGE_CHANNEL }}
+          SECRET_KEY: ${{ secrets.SECRET_KEY }}
+          BASE_URL: ${{ secrets.BASE_URL }}
+          FIREBASE_URL: ${{ secrets.FIREBASE_URL }}
+          SERVER_NAME: ${{ secrets.SERVER_NAME }}
+          ALLOWED_USERS: ${{ secrets.ALLOWED_USERS }}
+          
