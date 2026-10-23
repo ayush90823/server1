@@ -1,6 +1,8 @@
 import os
 import re
 import hashlib
+import hmac
+from html import escape as html_escape
 import logging
 import urllib.parse
 import asyncio
@@ -13,11 +15,12 @@ import aiohttp
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse, HTMLResponse
+from fastapi.responses import StreamingResponse, HTMLResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pyrogram import Client
 from pyrogram.errors import FloodWait
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import RetryAfter
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -38,10 +41,15 @@ PORT             = int(os.getenv("PORT", 8000))
 ALLOWED_USERS    = os.getenv("ALLOWED_USERS", "")
 FIREBASE_URL     = os.getenv("FIREBASE_URL", "")  # e.g. https://animeverse-9eada-default-rtdb.firebaseio.com
 SERVER_NAME      = os.getenv("SERVER_NAME", "Player")  # Firebase mein server field ki value
-ORIGIN_URL       = os.getenv("ORIGIN_URL", "")  # tunnel ka asli (badalne wala) URL — Worker isko Firebase se padhta hai
+ORIGIN_URL       = os.getenv("ORIGIN_URL", "")  # tunnel ka current URL (workflow khud set karta hai)
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+if SECRET_KEY in ("", "mysecretkey123"):
+    logger.warning("SECRET_KEY set nahi hai ya default hai! GitHub Secrets mein apna lamba random SECRET_KEY daalo.")
+if not ALLOWED_USERS.strip():
+    logger.warning("ALLOWED_USERS khaali hai — bot sabke liye khula hai!")
 
 # Single global Pyrogram Client instance — Yeh Bot aur Server dono ke liye ek hi rahega
 pyro = Client(
@@ -58,6 +66,7 @@ pyro = Client(
 # MESSAGE CACHE (bounded — low-RAM ke liye purane entries auto-evict honge)
 message_cache: OrderedDict = OrderedDict()
 MESSAGE_CACHE_LIMIT = 50  # max 50 messages cache mein
+MESSAGE_CACHE_TTL = 1800  # 30 min baad entry dobara fetch hogi (file_reference expire hone se bachne ke liye)
 
 # ── IN-MEMORY USER SETUP STORE ────────────────────────
 user_setup: dict = {}
@@ -65,6 +74,11 @@ user_setup: dict = {}
 # ── QUALITY BUFFER ─────────────────────────────────────
 quality_buffer: dict = {}
 QUALITY_COUNT = 3  # 480p, 720p, 1080p
+
+
+def quality_sort_key(q: str) -> int:
+    m = re.match(r"(\d+)", q or "")
+    return int(m.group(1)) if m else 0
 
 
 def assign_qualities(videos: list) -> dict:
@@ -110,10 +124,25 @@ def make_embed_link(msg_id, filename):
 
 
 def verify_code(msg_id, filename, code):
-    return generate_code(msg_id, filename) == code
+    return hmac.compare_digest(generate_code(msg_id, filename), code or "")
 
 
 # ── FIREBASE STATE SAVE / LOAD ─────────────────────────
+
+async def publish_origin():
+    """Tunnel ka current address Firebase mein likhta hai taaki Worker usko padh sake."""
+    if not (FIREBASE_URL and ORIGIN_URL):
+        return
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.put(
+                f"{FIREBASE_URL.rstrip('/')}/stream_origin.json",
+                json={"url": ORIGIN_URL.rstrip("/"), "time": int(time.time())},
+            ) as resp:
+                logger.info(f"Origin publish status: {resp.status}")
+    except Exception as e:
+        logger.error(f"publish_origin error: {e}")
+
 
 async def save_state_to_firebase():
     if not FIREBASE_URL:
@@ -158,29 +187,14 @@ async def load_state_from_firebase():
         logger.error(f"load_state_from_firebase error: {e}")
 
 
-async def publish_origin():
-    """Tunnel ka naya URL Firebase mein likhta hai, taaki Cloudflare Worker usse padh sake."""
-    if not (FIREBASE_URL and ORIGIN_URL):
-        return
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.put(
-                f"{FIREBASE_URL.rstrip('/')}/stream_origin.json",
-                json={"url": ORIGIN_URL, "time": int(time.time())},
-            ) as resp:
-                if resp.status == 200:
-                    logger.info(f"Origin Firebase mein save: {ORIGIN_URL}")
-                else:
-                    logger.warning(f"Origin save failed: {resp.status}")
-    except Exception as e:
-        logger.error(f"publish_origin error: {e}")
-
-
 def extract_episode(text: str):
     if not text:
         return None
     t = text.upper()
     ep_num = None
+    se_match = re.search(r'S\d{1,2}\s*E(\d{1,3})', t)
+    if se_match:
+        return int(se_match.group(1))
     ep_match = re.search(r'\bEP(?:ISODE)?\s*[-:→►\s]*\s*(\d{1,3})\b', t)
     if ep_match:
         ep_num = int(ep_match.group(1))
@@ -214,28 +228,19 @@ async def copy_with_floodwait(context, chat_id, from_chat_id, message_id, max_re
                 from_chat_id=from_chat_id,
                 message_id=message_id,
             )
-        except FloodWait as e:
-            logger.warning(f"FloodWait: {e.x}s wait kar raha hoon (attempt {attempt+1})")
-            await asyncio.sleep(e.x + 1)
-        except Exception as e:
-            err_str = str(e)
-            m = re.search(r'(?:flood|retry).*?(\d+)\s*sec', err_str, re.IGNORECASE)
-            if m:
-                wait_s = int(m.group(1))
-                logger.warning(f"FloodWait (text): {wait_s}s wait kar raha hoon (attempt {attempt+1})")
-                await asyncio.sleep(wait_s + 1)
-                continue
-            raise
+        except RetryAfter as e:
+            ra = e.retry_after
+            wait_s = ra.total_seconds() if hasattr(ra, "total_seconds") else ra
+            logger.warning(f"FloodWait: {wait_s}s wait kar raha hoon (attempt {attempt+1})")
+            await asyncio.sleep(wait_s + 1)
     raise RuntimeError("Max retries exceeded for copy_message (FloodWait loop).")
 
 
-async def save_to_firebase_with_retry(slug, season, ep_num, stream_link, quality=None, download_link=None, max_retries=10):
+async def save_to_firebase_with_retry(slug, season, ep_num, stream_link, quality=None, download_link=None, max_retries=3):
     for attempt in range(max_retries):
-        try:
-            return await save_to_firebase(slug, season, ep_num, stream_link, quality, download_link)
-        except FloodWait as e:
-            logger.warning(f"FloodWait (firebase): {e.x}s wait kar raha hoon (attempt {attempt+1})")
-            await asyncio.sleep(e.x + 1)
+        if await save_to_firebase(slug, season, ep_num, stream_link, quality, download_link):
+            return True
+        await asyncio.sleep(2 * (attempt + 1))
     return False
 
 
@@ -533,7 +538,7 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw_name = ""
 
     if msg.video:
-        file_obj = msg.video
+       file_obj = msg.video
         raw_name = msg.video.file_name or ""
     elif msg.document:
         file_obj = msg.document
@@ -601,11 +606,16 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
  
             quality_lines = "\n".join([
                 f"  *{r['quality']}* — {r['size_mb']} MB\n  ▶️ Stream: `{r['link']}`\n  🖼️ Embed: `{r['embed_link']}`\n  ⬇️ Download: `{r['dl_link']}`"
-                for r in sorted(results, key=lambda x: x["quality"], reverse=True)
+                for r in sorted(results, key=lambda x: quality_sort_key(x["quality"]), reverse=True)
             ])
             await msg.reply_text(f"🎉 *Teeno Quality Secured & Saved!*\n\n🎌 *Anime:* `{setup['slug']}`\n{quality_lines}", parse_mode="Markdown")
         except Exception as e:
             logger.error(f"handle_media error: {e}")
+            try:
+                await processing.delete()
+            except Exception:
+                pass
+            await msg.reply_text("❌ Process karte waqt error aaya, dobara try karo.")
     else:
         filename = raw_name or f"video_{file_obj.file_unique_id}.mp4"
         processing = await msg.reply_text("⏳ Processing...")
@@ -627,6 +637,11 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception as e:
             logger.error(f"handle_media error: {e}")
+            try:
+                await processing.delete()
+            except Exception:
+                pass
+            await msg.reply_text("❌ Process karte waqt error aaya, dobara try karo.")
  
  
 async def get_link_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -653,7 +668,6 @@ async def lifespan(app: FastAPI):
     # App startup par global pyro client ko ek hi baar start karega
     await pyro.start()
     logger.info("Single Pyrogram Client successfully started!")
-    await publish_origin()
     try:
         if STORAGE_CHANNEL:
             chat_info = await pyro.get_chat(STORAGE_CHANNEL)
@@ -661,6 +675,7 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Startup peer channel cache error: {e}")
     await load_state_from_firebase()
+    await publish_origin()
     yield
     await pyro.stop()
  
@@ -688,7 +703,7 @@ async def watch_file(msg_id: int, filename: str, code: str):
         raise HTTPException(status_code=403, detail="Invalid Link or Brand verification failed.")
  
     stream_url = f"/animeverse/dl/{msg_id}/{urllib.parse.quote(decoded)}?code={code}"
-    safe_title = decoded.replace('"', '&quot;')
+    safe_title = html_escape(decoded, quote=True)
  
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -725,15 +740,20 @@ async def fetch_segment(message, seg_offset: int, seg_limit: int, retries: int =
  
  
 # BRANDED ROUTE 2: STREAM / DOWNLOAD (FIXED EXTRACTION)
-@web_app.get("/animeverse/dl/{msg_id}/{filename:path}")
+@web_app.api_route("/animeverse/dl/{msg_id}/{filename:path}", methods=["GET", "HEAD"])
 async def stream_file(msg_id: int, filename: str, code: str, request: Request, dl: int = 0):
     decoded = urllib.parse.unquote(filename)
  
     if not verify_code(msg_id, decoded, code):
         raise HTTPException(status_code=403, detail="Access Denied: Link manipulation detected.")
  
-    if msg_id in message_cache:
-        message = message_cache[msg_id]
+    cached = message_cache.get(msg_id)
+    if cached and time.time() - cached[0] > MESSAGE_CACHE_TTL:
+        message_cache.pop(msg_id, None)
+        cached = None
+ 
+    if cached:
+        message = cached[1]
         message_cache.move_to_end(msg_id)  # LRU: recently used ko end pe rakho
     else:
         try:
@@ -741,7 +761,7 @@ async def stream_file(msg_id: int, filename: str, code: str, request: Request, d
             message = await pyro.get_messages(STORAGE_CHANNEL, msg_id)
             if not message or message.empty:
                 raise ValueError("Empty message from Telegram")
-            message_cache[msg_id] = message
+            message_cache[msg_id] = (time.time(), message)
             if len(message_cache) > MESSAGE_CACHE_LIMIT:
                 message_cache.popitem(last=False)  # sabse purana entry hata do (RAM bounded rakhne ke liye)
         except Exception as e:
@@ -794,6 +814,9 @@ async def stream_file(msg_id: int, filename: str, code: str, request: Request, d
     }
     if range_header:
         response_headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+ 
+    if request.method == "HEAD":
+        return Response(status_code=206 if range_header else 200, headers=response_headers)
  
     # ---- Parallel read-ahead plan ----
     # Pehla segment sirf 1 chunk (jaldi pehla byte), baaki SEG_CHUNKS ke segments.
@@ -868,10 +891,11 @@ async def run_server():
 async def main():
     bot_app = await run_bot()
     try:
-        await asyncio.gather(run_server())
+        await run_server()
     finally:
         await bot_app.updater.stop()
         await bot_app.stop()
+        await bot_app.shutdown()
  
 if __name__ == "__main__":
     asyncio.run(main())
