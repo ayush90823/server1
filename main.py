@@ -1,12 +1,14 @@
 import os
 import re
 import hashlib
+import mimetypes
 import hmac
 from html import escape as html_escape
 import logging
 import urllib.parse
 import asyncio
 import math
+import shutil
 import time
 from collections import OrderedDict
 from contextlib import asynccontextmanager
@@ -21,6 +23,8 @@ from pyrogram import Client
 from pyrogram.errors import FloodWait
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import RetryAfter
+
+import media_fix
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -529,6 +533,78 @@ async def current_setup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"📋 *Current Setup:*\n🎌 *Anime:* `{setup['slug']}`\n📺 *Season:* `{setup['season']}`", parse_mode="Markdown")
 
 
+async def ensure_compatible(processing, storage_msg_id: int, raw_name: str, ext: str, file_size: int, mime: str = "") -> dict:
+    """
+    Storage mein gayi video ko check karta hai. Browser-compatible hai to kuch nahi karta.
+    Nahi hai to plan dikhata hai, convert karke naya message banata hai, purana delete karta hai.
+    Hamesha dict return karta hai: {sid, ext, size, note}. Fail hone par original as-is rehti hai.
+    """
+    default = {"sid": storage_msg_id, "ext": ext, "size": file_size, "note": ""}
+    try:
+        if not (media_fix.AUTO_CONVERT and media_fix.tools_available() and media_fix.is_video_like(ext, mime)):
+            return default
+ 
+        probe_name = f"probe.{ext}"
+        code = generate_code(storage_msg_id, probe_name)
+        url = f"http://127.0.0.1:{PORT}/animeverse/dl/{storage_msg_id}/{urllib.parse.quote(probe_name)}?code={code}"
+ 
+        try:
+            await processing.edit_text("🔍 Video analyze ho rahi hai...")
+        except Exception:
+            pass
+ 
+        info = await media_fix.probe(url)
+        plan = media_fix.analyze(info) if info else None
+        if plan is None:
+            default["note"] = "⚠️ Analyze nahi ho saki — original as-is store hui"
+            return default
+ 
+        if not plan.needs_work:
+            return {"sid": storage_msg_id, "ext": "mp4", "size": file_size, "note": plan.summary}
+ 
+        display_name = raw_name or f"video.{ext}"
+ 
+        if file_size and file_size > media_fix.MAX_PROCESS_BYTES:
+            default["note"] = "⚠️ Browser mein shayad na chale, par file bahut badi hai — as-is store hui"
+            return default
+ 
+        os.makedirs(media_fix.WORK_DIR, exist_ok=True)
+        if shutil.disk_usage(media_fix.WORK_DIR).free < (file_size or 0) * 2.5:
+            default["note"] = "⚠️ Convert ke liye disk space kam hai — as-is store hui"
+            return default
+ 
+        ui = media_fix.StatusUI(processing, display_name, file_size, plan)
+        if media_fix.convert_lock.locked():
+            ui.queued = True
+            await ui.push(force=True)
+ 
+        async with media_fix.convert_lock:
+            ui.queued = False
+            await ui.start()
+            try:
+                sent = await media_fix.run_pipeline(
+                    url=url, name=display_name, size=file_size, p=plan, ui=ui,
+                    pyro=pyro, chat_id=STORAGE_CHANNEL,
+                )
+            except Exception as e:
+                logger.error(f"convert failed for msg {storage_msg_id}: {e}")
+                await ui.stop(footer="❌ Convert fail hua — original video as-is store hui.")
+                default["note"] = "❌ Convert fail hua — original as-is store hui"
+                return default
+            await ui.stop(footer="🎉 Complete!")
+ 
+        try:
+            await pyro.delete_messages(STORAGE_CHANNEL, storage_msg_id)  # purani (incompatible) copy hatao
+        except Exception as e:
+            logger.warning(f"old storage msg delete nahi hua ({storage_msg_id}): {e}")
+ 
+        final_size = getattr(getattr(sent, "video", None), "file_size", 0) or file_size
+        return {"sid": sent.id, "ext": "mp4", "size": final_size, "note": plan.summary}
+    except Exception as e:
+        logger.error(f"ensure_compatible error: {e}")
+        return default
+ 
+ 
 async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         return
@@ -536,7 +612,7 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     file_obj = None
     raw_name = ""
-
+ 
     if msg.video:
         file_obj = msg.video
         raw_name = msg.video.file_name or ""
@@ -551,12 +627,12 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         raw_name = ""
     else:
         return
-
+ 
     caption_text = msg.caption or ""
     ep_num = extract_episode(caption_text)
     if ep_num is None and raw_name:
         ep_num = extract_episode(raw_name)
-
+ 
     setup = user_setup.get(uid)
     if setup:
         # ZIP file (poora season) — episode flow se alag handle hota hai
@@ -572,40 +648,54 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             forwarded = await copy_with_floodwait(context, chat_id=STORAGE_CHANNEL, from_chat_id=msg.chat_id, message_id=msg.message_id)
             storage_msg_id = forwarded.message_id
-
+ 
+            fixed = await ensure_compatible(
+                processing, storage_msg_id,
+                raw_name or f"{setup['slug']}-{setup['season']}-E{ep_num}.{ext}",
+                ext, file_size, getattr(file_obj, "mime_type", "") or "",
+            )
+ 
             if uid not in quality_buffer:
                 quality_buffer[uid] = {}
             if ep_num not in quality_buffer[uid]:
                 quality_buffer[uid][ep_num] = []
-
-            quality_buffer[uid][ep_num].append({"size": file_size, "sid": storage_msg_id, "ext": ext})
+ 
+            # size = original size (quality order ke liye), final_size = convert ke baad ki size
+            quality_buffer[uid][ep_num].append({
+                "size": file_size, "sid": fixed["sid"], "ext": fixed["ext"],
+                "note": fixed["note"], "final_size": fixed["size"],
+            })
+            collected = len(quality_buffer[uid][ep_num])  # await se pehle — concurrent handlers mein race na ho
             await save_state_to_firebase()
-            collected = len(quality_buffer[uid][ep_num])
             await processing.delete()
-
+ 
             if collected < QUALITY_COUNT:
-                await msg.reply_text(f"✅ *Video {collected}/{QUALITY_COUNT} mila!*", parse_mode="Markdown")
+                note_line = f"\n{fixed['note']}" if fixed["note"] else ""
+                await msg.reply_text(f"✅ *Video {collected}/{QUALITY_COUNT} mila!*{note_line}", parse_mode="Markdown")
                 return
-
+            if collected > QUALITY_COUNT:
+                await msg.reply_text(f"⚠️ Is episode ke liye {QUALITY_COUNT} videos pehle se aa chuki hain.")
+                return
+ 
             videos = quality_buffer[uid][ep_num]
             quality_map = assign_qualities(videos)
             results = []
-
+ 
             for i, vid in enumerate(videos):
                 quality = quality_map[i]
                 filename = f"{setup['slug']}-{setup['season']}-E{ep_num}-{quality}.{vid['ext']}"
                 stream_link = make_stream_link(vid["sid"], filename)
                 download_link = make_download_link(vid["sid"], filename)
                 embed_link = make_embed_link(vid["sid"], filename)
-
+ 
                 fb_saved = await save_to_firebase_with_retry(setup["slug"], setup["season"], ep_num, stream_link, quality, download_link)
-                results.append({"quality": quality, "link": stream_link, "dl_link": download_link, "embed_link": embed_link, "size_mb": round(vid["size"] / (1024*1024), 2), "saved": fb_saved})
-
+                results.append({"quality": quality, "link": stream_link, "dl_link": download_link, "embed_link": embed_link, "size_mb": round((vid.get("final_size") or vid["size"]) / (1024*1024), 2), "note": vid.get("note", ""), "saved": fb_saved})
+ 
             del quality_buffer[uid][ep_num]
             await save_state_to_firebase()
-
+ 
             quality_lines = "\n".join([
-                f"  *{r['quality']}* — {r['size_mb']} MB\n  ▶️ Stream: `{r['link']}`\n  🖼️ Embed: `{r['embed_link']}`\n  ⬇️ Download: `{r['dl_link']}`"
+                f"  *{r['quality']}* — {r['size_mb']} MB{(chr(10) + '  ' + r['note']) if r['note'] else ''}\n  ▶️ Stream: `{r['link']}`\n  🖼️ Embed: `{r['embed_link']}`\n  ⬇️ Download: `{r['dl_link']}`"
                 for r in sorted(results, key=lambda x: quality_sort_key(x["quality"]), reverse=True)
             ])
             await msg.reply_text(f"🎉 *Teeno Quality Secured & Saved!*\n\n🎌 *Anime:* `{setup['slug']}`\n{quality_lines}", parse_mode="Markdown")
@@ -622,12 +712,21 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             forwarded = await copy_with_floodwait(context, chat_id=STORAGE_CHANNEL, from_chat_id=msg.chat_id, message_id=msg.message_id)
             storage_msg_id = forwarded.message_id
+            orig_ext = get_extension(filename, fallback="mp4")
+            fixed = await ensure_compatible(
+                processing, storage_msg_id, filename, orig_ext,
+                file_obj.file_size or 0, getattr(file_obj, "mime_type", "") or "",
+            )
+            storage_msg_id = fixed["sid"]
+            if fixed["ext"] != orig_ext:
+                filename = os.path.splitext(filename)[0] + "." + fixed["ext"]
             stream_link = make_stream_link(storage_msg_id, filename)
             download_link = make_download_link(storage_msg_id, filename)
             embed_link = make_embed_link(storage_msg_id, filename)
             await processing.delete()
             await msg.reply_text(
-                f"▶️ *Stream Link:*\n`{stream_link}`\n\n🖼️ *Embed Link:*\n`{embed_link}`\n\n⬇️ *Download Link:*\n`{download_link}`",
+                f"▶️ *Stream Link:*\n`{stream_link}`\n\n🖼️ *Embed Link:*\n`{embed_link}`\n\n⬇️ *Download Link:*\n`{download_link}`"
+                + (f"\n\n{fixed['note']}" if fixed["note"] else ""),
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("▶️ Stream", url=stream_link)],
@@ -642,8 +741,8 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
             await msg.reply_text("❌ Process karte waqt error aaya, dobara try karo.")
-
-
+ 
+ 
 async def get_link_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         return
@@ -659,10 +758,10 @@ async def get_link_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"🔗 *Secured Links:*\n`{link}`\n`{embed_link}`\n`{dl_link}`", parse_mode="Markdown")
     except ValueError:
         pass
-
-
+ 
+ 
 # ── FASTAPI SERVER WITH SINGLE CLIENT FIX ─────────────────────────────
-
+ 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # App startup par global pyro client ko ek hi baar start karega
@@ -678,33 +777,33 @@ async def lifespan(app: FastAPI):
     await publish_origin()
     yield
     await pyro.stop()
-
-
+ 
+ 
 web_app = FastAPI(title="AnimeVerse TG Stream Server", lifespan=lifespan)
-
+ 
 web_app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["GET", "HEAD", "OPTIONS"],
     allow_headers=["Range", "Content-Type", "Authorization"],
 )
-
-
+ 
+ 
 @web_app.get("/")
 async def index():
     return HTMLResponse("<html><body style='font-family:sans-serif;text-align:center;padding:80px;background:#000;color:#fff'><h1>🎬 AnimeVerse Stream Server</h1><p>Active & Secured 🔒</p></body></html>")
-
-
+ 
+ 
 # BRANDED ROUTE 1: WATCH PLAYER
 @web_app.get("/animeverse/watch/{msg_id}/{filename:path}")
 async def watch_file(msg_id: int, filename: str, code: str):
     decoded = urllib.parse.unquote(filename)
     if not verify_code(msg_id, decoded, code):
         raise HTTPException(status_code=403, detail="Invalid Link or Brand verification failed.")
-
+ 
     stream_url = f"/animeverse/dl/{msg_id}/{urllib.parse.quote(decoded)}?code={code}"
     safe_title = html_escape(decoded, quote=True)
-
+ 
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head><meta charset="UTF-8"><title>{safe_title}</title>
@@ -713,14 +812,14 @@ async def watch_file(msg_id: int, filename: str, code: str):
 <body><video src="{stream_url}" controls playsinline></video></body>
 </html>"""
     return HTMLResponse(html)
-
-
+ 
+ 
 # ── PARALLEL STREAM SETTINGS ──────────────────────────
 SEG_CHUNKS = int(os.getenv("SEG_CHUNKS", "2"))   # ek fetch task = 2 x 1MB (0.15GB RAM plan ke liye)
 PREFETCH   = int(os.getenv("PREFETCH", "2"))     # kitne segments ek saath Telegram se aayenge
 # RAM use ~ SEG_CHUNKS * PREFETCH MB per viewer (default ~12MB). Low RAM ho to PREFETCH=2 karo.
-
-
+ 
+ 
 async def fetch_segment(message, seg_offset: int, seg_limit: int, retries: int = 2) -> bytes:
     """Telegram se seg_limit chunks (1MB each) lata hai, fail hone par retry."""
     last = None
@@ -737,21 +836,21 @@ async def fetch_segment(message, seg_offset: int, seg_limit: int, retries: int =
             last = e
             await asyncio.sleep(0.3 * (attempt + 1))
     raise last
-
-
+ 
+ 
 # BRANDED ROUTE 2: STREAM / DOWNLOAD (FIXED EXTRACTION)
 @web_app.api_route("/animeverse/dl/{msg_id}/{filename:path}", methods=["GET", "HEAD"])
 async def stream_file(msg_id: int, filename: str, code: str, request: Request, dl: int = 0):
     decoded = urllib.parse.unquote(filename)
-
+ 
     if not verify_code(msg_id, decoded, code):
         raise HTTPException(status_code=403, detail="Access Denied: Link manipulation detected.")
-
+ 
     cached = message_cache.get(msg_id)
     if cached and time.time() - cached[0] > MESSAGE_CACHE_TTL:
         message_cache.pop(msg_id, None)
         cached = None
-
+ 
     if cached:
         message = cached[1]
         message_cache.move_to_end(msg_id)  # LRU: recently used ko end pe rakho
@@ -767,15 +866,17 @@ async def stream_file(msg_id: int, filename: str, code: str, request: Request, d
         except Exception as e:
             logger.error(f"Media extraction crash for msg_id {msg_id}: {e}")
             raise HTTPException(status_code=404, detail="Media extraction failed from Telegram Storage.")
-
+ 
     media = message.video or message.document or message.audio or message.video_note
     if not media:
         raise HTTPException(status_code=404, detail="No media found in the specified storage ID.")
         
     file_size = media.file_size
-    mime_type = getattr(media, "mime_type", "video/mp4")
+    mime_type = getattr(media, "mime_type", None)
+    if not mime_type or mime_type == "application/octet-stream":
+        mime_type = mimetypes.guess_type(decoded)[0] or "video/mp4"
     CHUNK_SIZE = 1 * 1024 * 1024
-
+ 
     # ---- Range parsing (suffix range "bytes=-N" bhi supported) ----
     range_header = request.headers.get("range")
     start = 0
@@ -796,15 +897,15 @@ async def stream_file(msg_id: int, filename: str, code: str, request: Request, d
         if start >= file_size or start > end:
             raise HTTPException(status_code=416, detail="Range not satisfiable",
                                 headers={"Content-Range": f"bytes */{file_size}"})
-
+ 
     content_length = end - start + 1
     offset = start // CHUNK_SIZE
     first_chunk_cut = start % CHUNK_SIZE
     limit = math.ceil((content_length + first_chunk_cut) / CHUNK_SIZE)
-
+ 
     download_filename = f"[AnimeVerse] {decoded}"
     safe_filename = urllib.parse.quote(download_filename)
-
+ 
     response_headers = {
         "Content-Type": mime_type,
         "Accept-Ranges": "bytes",
@@ -814,10 +915,10 @@ async def stream_file(msg_id: int, filename: str, code: str, request: Request, d
     }
     if range_header:
         response_headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
-
+ 
     if request.method == "HEAD":
         return Response(status_code=206 if range_header else 200, headers=response_headers)
-
+ 
     # ---- Parallel read-ahead plan ----
     # Pehla segment sirf 1 chunk (jaldi pehla byte), baaki SEG_CHUNKS ke segments.
     segs = []
@@ -826,7 +927,7 @@ async def stream_file(msg_id: int, filename: str, code: str, request: Request, d
         n = 1 if i == 0 else min(SEG_CHUNKS, limit - i)
         segs.append((offset + i, n))
         i += n
-
+ 
     async def generator():
         tasks = []
         next_i = 0
@@ -860,14 +961,14 @@ async def stream_file(msg_id: int, filename: str, code: str, request: Request, d
         finally:
             for t in tasks:
                 t.cancel()
-
+ 
     return StreamingResponse(generator(), status_code=206 if range_header else 200, headers=response_headers)
-
-
+ 
+ 
 # ── MAIN RUNNER ───────────────────────────────────────
-
+ 
 async def run_bot():
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).concurrent_updates(True).build()
     await app.bot.delete_webhook(drop_pending_updates=True)
     app.add_handler(CommandHandler("start",       start))
     app.add_handler(CommandHandler("setup",       setup_cmd))
@@ -880,14 +981,14 @@ async def run_bot():
     await app.start()
     await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
     return app
-
-
+ 
+ 
 async def run_server():
     config = uvicorn.Config(web_app, host="0.0.0.0", port=PORT, log_level="info")
     server = uvicorn.Server(config)
     await server.serve()
-
-
+ 
+ 
 async def main():
     bot_app = await run_bot()
     try:
@@ -896,6 +997,6 @@ async def main():
         await bot_app.updater.stop()
         await bot_app.stop()
         await bot_app.shutdown()
-
+ 
 if __name__ == "__main__":
     asyncio.run(main())
