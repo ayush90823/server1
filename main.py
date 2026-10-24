@@ -4,6 +4,8 @@ import hashlib
 import json
 import mimetypes
 import shutil
+import tempfile
+import zipfile
 import hmac
 from html import escape as html_escape
 import logging
@@ -27,6 +29,7 @@ from telegram.error import RetryAfter
 from telegram.ext import (
     Application,
     CommandHandler,
+    CallbackQueryHandler,
     MessageHandler,
     filters,
     ContextTypes,
@@ -73,6 +76,11 @@ MESSAGE_CACHE_TTL = 1800  # 30 min baad entry dobara fetch hogi (file_reference 
 
 # ── IN-MEMORY USER SETUP STORE ────────────────────────
 user_setup: dict = {}
+
+# ── ZIP FEATURE STATE ─────────────────────────────────
+zip_session: dict = {}   # uid -> {"videos": [...]}  (collect mode)
+pending_zip: dict = {}   # uid -> zip upload ho chuka, episode/range ka jawab baaki
+zip_jobs: dict = {}      # uid -> running job (cancel flag)
 
 # ── QUALITY BUFFER ─────────────────────────────────────
 quality_buffer: dict = {}
@@ -157,7 +165,12 @@ async def save_state_to_firebase():
             str(uid): {str(ep): vids for ep, vids in eps.items()}
             for uid, eps in quality_buffer.items()
         }
-        payload = {"user_setup": setup_data, "quality_buffer": buffer_data}
+        payload = {
+            "user_setup": setup_data,
+            "quality_buffer": buffer_data,
+            "zip_session": {str(k): v for k, v in zip_session.items()},
+            "pending_zip": {str(k): v for k, v in pending_zip.items()},
+        }
         async with aiohttp.ClientSession() as session:
             async with session.put(f"{db_url}/bot_state.json", json=payload) as resp:
                 if resp.status == 200:
@@ -185,6 +198,11 @@ async def load_state_from_firebase():
                 for uid_str, eps in data.get("quality_buffer", {}).items():
                     uid = int(uid_str)
                     quality_buffer[uid] = {int(ep): vids for ep, vids in eps.items()}
+                for k, v in (data.get("zip_session") or {}).items():
+                    v.setdefault("videos", [])
+                    zip_session[int(k)] = v
+                for k, v in (data.get("pending_zip") or {}).items():
+                    pending_zip[int(k)] = v
                 logger.info(f"State load ho gaya. Users: {len(user_setup)}, Buffers: {len(quality_buffer)}")
     except Exception as e:
         logger.error(f"load_state_from_firebase error: {e}")
@@ -336,13 +354,48 @@ def human_size(num_bytes: int) -> str:
     return f"{num_bytes / (1024 ** 2):.0f} MB"
 
 
-async def save_zip_to_firebase(slug: str, season: str, quality: str, download_link: str, size_text: str = "") -> bool:
+_QUALITY_STRIP_RE = re.compile(r'(?<!\d)(1080|720|480)\s*[pP](?![a-zA-Z0-9])')
+_RANGE_RE = re.compile(
+    r'(?<![\w.])(?:EP(?:ISODES?)?|E)?\s*[-:.]?\s*(\d{1,4})\s*'
+    r'(?:-|–|—|→|~|to|se|TO|SE)\s*'
+    r'(?:EP(?:ISODES?)?|E)?\s*[-:.]?\s*(\d{1,4})(?![\w])',
+    re.IGNORECASE,
+)
+
+
+def extract_ep_range(*texts):
+    """Caption/filename/link-text se episode range nikalta hai.
+    '1-12', 'EP 1-12', 'E1-E12', 'ep1 to ep12', '13 se 24' -> (1, 12)
+    Range nahi mili to None (poora season ZIP maana jayega)."""
+    for t in texts:
+        if not t:
+            continue
+        cleaned = _QUALITY_STRIP_RE.sub(" ", t)
+        cleaned = re.sub(r'https?://\S+', " ", cleaned)
+        m = _RANGE_RE.search(cleaned)
+        if not m:
+            continue
+        a, b = int(m.group(1)), int(m.group(2))
+        if a > b:
+            a, b = b, a
+        if a == 0 and b == 0:
+            continue
+        return a, b
+    return None
+
+
+async def save_zip_to_firebase(slug: str, season: str, quality: str, download_link: str,
+                               size_text: str = "", ep_range=None) -> bool:
+    """ep_range=(start, end) ho to:
+         zip_links/{slug}/{season}/{quality}/parts/{start}-{end}
+       warna (purana tareeka, poora season):
+         zip_links/{slug}/{season}/{quality}
+    """
     if not FIREBASE_URL:
         logger.error("FIREBASE_URL set nahi hai, ZIP save nahi ho sakta.")
         return False
     try:
         db_url = FIREBASE_URL.rstrip("/")
-        path = f"zip_links/{slug}/{season}/{quality}"
         payload = {
             "link"  : download_link,
             "server": SERVER_NAME,
@@ -350,8 +403,15 @@ async def save_zip_to_firebase(slug: str, season: str, quality: str, download_li
         }
         if size_text:
             payload["size"] = size_text
+        if ep_range:
+            start, end = ep_range
+            path = f"zip_links/{slug}/{season}/{quality}/parts/{start}-{end}"
+            payload.update({"start": start, "end": end, "label": (f"EP {start}" if start == end else f"EP {start} - {end}")})
+        else:
+            path = f"zip_links/{slug}/{season}/{quality}"
         async with aiohttp.ClientSession() as session:
-            async with session.put(f"{db_url}/{path}.json", json=payload) as resp:
+            # PATCH use kiya taaki full-season save karne par parts delete na hon
+            async with session.patch(f"{db_url}/{path}.json", json=payload) as resp:
                 if resp.status == 200:
                     logger.info(f"Firebase ZIP saved: {path}")
                     return True
@@ -365,10 +425,12 @@ async def save_zip_to_firebase(slug: str, season: str, quality: str, download_li
 
 async def handle_zip_upload(msg, context, setup: dict, file_obj, raw_name: str):
     quality = extract_zip_quality(msg.caption or "", raw_name)
+    ep_range = extract_ep_range(msg.caption or "", raw_name)
     if not quality:
         await msg.reply_text(
             "⚠️ *ZIP ki quality nahi mili!*\n\n"
-            "ZIP dobara bhejo aur caption me quality likho, jaise: `720p` (1080p / 720p / 480p).",
+            "ZIP dobara bhejo aur caption me quality aur episodes likho, jaise:\n"
+            "`720p EP 1-12`  (1080p / 720p / 480p)",
             parse_mode="Markdown",
         )
         return
@@ -378,11 +440,12 @@ async def handle_zip_upload(msg, context, setup: dict, file_obj, raw_name: str):
         forwarded = await copy_with_floodwait(context, chat_id=STORAGE_CHANNEL, from_chat_id=msg.chat_id, message_id=msg.message_id)
         storage_msg_id = forwarded.message_id
 
-        filename = f"{setup['slug']}-{setup['season']}-ZIP-{quality}.zip"
+        range_tag = f"-EP{ep_range[0]}-{ep_range[1]}" if ep_range else ""
+        filename = f"{setup['slug']}-{setup['season']}{range_tag}-ZIP-{quality}.zip"
         download_link = make_download_link(storage_msg_id, filename)
         size_text = human_size(file_obj.file_size or 0)
 
-        saved = await save_zip_to_firebase(setup["slug"], setup["season"], quality, download_link, size_text)
+        saved = await save_zip_to_firebase(setup["slug"], setup["season"], quality, download_link, size_text, ep_range)
         await processing.delete()
 
         status = "✅ Firebase me save ho gaya" if saved else "⚠️ Firebase save fail — link manually daalna padega"
@@ -391,6 +454,7 @@ async def handle_zip_upload(msg, context, setup: dict, file_obj, raw_name: str):
             f"🎌 *Anime:* `{setup['slug']}`\n"
             f"📺 *Season:* `{setup['season']}`\n"
             f"🎞️ *Quality:* `{quality}`\n"
+            f"🔢 *Episodes:* `{f'{ep_range[0]} - {ep_range[1]}' if ep_range else 'Full Season (range nahi di)'}`\n"
             f"💾 *Size:* {size_text or 'unknown'}\n"
             f"⬇️ *Download:* `{download_link}`\n\n{status}",
             parse_mode="Markdown",
@@ -440,6 +504,9 @@ async def handle_text_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     msg = update.message
     text = msg.text or ""
+    if update.effective_user.id in pending_zip:
+        if await handle_zip_text_answer(update, context):
+            return
     if not URL_RE.search(text):
         return  # normal text — ignore
 
@@ -459,13 +526,15 @@ async def handle_text_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not quality:
             failed.append(f"{url} — quality nahi mili")
             continue
+        ep_range = extract_ep_range(extra)
         size_text = human_size(await fetch_remote_size(url))
-        saved = await save_zip_to_firebase(setup["slug"], setup["season"], quality, url, size_text)
+        saved = await save_zip_to_firebase(setup["slug"], setup["season"], quality, url, size_text, ep_range)
         if saved:
-            done.append(f"{quality}" + (f" ({size_text})" if size_text else ""))
+            rtxt = f" EP {ep_range[0]}-{ep_range[1]}" if ep_range else " (full)"
+            done.append(f"{quality}{rtxt}" + (f" ({size_text})" if size_text else ""))
         else:
             failed.append(f"{quality} — Firebase save fail")
-
+ 
     if not done and not failed:
         return
     lines = [f"📦 ZIP link save — {setup['slug']} {setup['season']}"]
@@ -473,12 +542,694 @@ async def handle_text_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append("✅ Saved: " + ", ".join(done))
     if failed:
         lines.append("⚠️ Problem:\n" + "\n".join(failed))
-        lines.append("\nLink ke end me 1080p / 720p / 480p likho.")
+        lines.append("\nFormat: <link> 720p EP 1-12")
     await msg.reply_text("\n".join(lines), disable_web_page_preview=True)
-
-
+ 
+ 
+# ── MULTI-VIDEO → ZIP FEATURE ─────────────────────────
+# Flow:
+#   /setup <slug> <season> zip      (ya /setup ... phir /zip)
+#   videos forward karo  ->  /done
+#   Bot sab videos ko ek ZIP me pack karta hai (compression nahi, video pehle se compressed hota hai),
+#   STORAGE_CHANNEL me upload karta hai, link banata hai, phir puchta hai:
+#   "konsa episode / kaunsi range me save karu?"  ->  Firebase zip_links/... me save.
+#
+# RAM kam rakhne ke liye video seedha Telegram se stream hoke ZIP me likha jata hai
+# (4MB buffer). Disk par sirf ek ZIP part rehta hai, upload ke baad turant delete.
+ 
+ZIP_PART_MB    = int(os.getenv("ZIP_PART_MB", "1900"))     # Telegram bot upload limit ~2000MB; isse chhota rakho
+ZIP_SEG_CHUNKS = int(os.getenv("ZIP_SEG_CHUNKS", "4"))     # 4 x 1MB per fetch
+ZIP_TMP_DIR    = os.getenv("ZIP_TMP_DIR", tempfile.gettempdir())
+VIDEO_EXTS     = {"mp4", "mkv", "avi", "webm", "mov", "m4v", "ts", "flv"}
+ 
+try:
+    from pyrogram import StopTransmission
+except Exception:  # purane/alag Pyrogram fork ke liye
+    class StopTransmission(Exception):
+        pass
+ 
+ 
+class ZipCancelled(Exception):
+    pass
+ 
+ 
+async def run_blocking(fn, *args):
+    return await asyncio.get_running_loop().run_in_executor(None, fn, *args)
+ 
+ 
+class StatusMsg:
+    """Ek message ko throttle karke edit karta hai (Telegram flood se bachne ke liye)."""
+ 
+    def __init__(self, bot, chat_id: int, message_id: int, interval: float = 3.0):
+        self.bot, self.chat_id, self.message_id = bot, chat_id, message_id
+        self.interval = interval
+        self.last = 0.0
+        self.last_text = ""
+ 
+    async def update(self, text: str, force: bool = False):
+        now = time.time()
+        if text == self.last_text or (not force and now - self.last < self.interval):
+            return
+        self.last, self.last_text = now, text
+        try:
+            await self.bot.edit_message_text(chat_id=self.chat_id, message_id=self.message_id, text=text)
+        except Exception:
+            pass
+ 
+ 
+def fmt_ep_range(a: int, b: int) -> str:
+    return f"EP {a}" if a == b else f"EP {a}-{b}"
+ 
+ 
+def is_video_media(msg) -> bool:
+    if msg.video:
+        return True
+    if msg.document:
+        mime = (msg.document.mime_type or "").lower()
+        name = (msg.document.file_name or "").lower()
+        ext = name.rsplit(".", 1)[-1] if "." in name else ""
+        return mime.startswith("video/") or ext in VIDEO_EXTS
+    return False
+ 
+ 
+def zip_video_sort_key(v: dict):
+    # episode number wale pehle (ep order me), baaki forward hone ke order me
+    return (v.get("ep") is None, v.get("ep") or 0, v.get("n", 0))
+ 
+ 
+def plan_zip_parts(videos: list, limit_bytes: int) -> list:
+    parts, cur, cur_size = [], [], 0
+    for v in videos:
+        size = v.get("size", 0)
+        if cur and cur_size + size > limit_bytes:
+            parts.append(cur)
+            cur, cur_size = [], 0
+        cur.append(v)
+        cur_size += size
+    if cur:
+        parts.append(cur)
+    return parts
+ 
+ 
+def part_ep_hint(vids: list):
+    eps = [v.get("ep") for v in vids]
+    if eps and all(e is not None for e in eps):
+        return [min(eps), max(eps)]
+    return None
+ 
+ 
+def zip_arcname(v: dict, setup: dict, used: set) -> str:
+    name = (v.get("name") or "").strip()
+    if not name:
+        ep = v.get("ep")
+        tail = f"E{ep}" if ep is not None else f"video{v.get('n', 0)}"
+        name = f"{setup['slug']}-{setup['season']}-{tail}.{v.get('ext', 'mp4')}"
+    name = re.sub(r'[\\/:*?"<>|]', "_", name)
+    if "." in name:
+        stem, ext = name.rsplit(".", 1)
+        ext = "." + ext
+    else:
+        stem, ext = name, ""
+    final, i = name, 2
+    while final in used:
+        final = f"{stem}_{i}{ext}"
+        i += 1
+    used.add(final)
+    return final
+ 
+ 
+def start_zip_mode(uid: int):
+    """(ok, message) return karta hai."""
+    if uid in zip_jobs:
+        return False, "⏳ Pichla zip abhi ban raha hai, khatam hone do ya /cancelzip karo."
+    if uid in pending_zip:
+        return False, "⚠️ Pichle zip ka episode/range abhi baaki hai. Pehle uska jawab do ya /cancelzip karo."
+    zip_session[uid] = {"videos": [], "status_msg_id": None, "last_edit": 0}
+    return True, (
+        "📦 ZIP MODE ON\n\n"
+        "Ab saare videos forward karo (480p/720p/1080p jo bhi ho).\n"
+        "Sab bhej do to /done likho — main unka ZIP bana ke storage channel me daal dunga.\n"
+        "Cancel karna ho to /cancelzip"
+    )
+ 
+ 
+async def zip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        return
+    uid = update.effective_user.id
+    if uid not in user_setup:
+        await update.message.reply_text("⚠️ Pehle /setup <anime-slug> <season> karo.")
+        return
+    ok, text = start_zip_mode(uid)
+    if ok:
+        await save_state_to_firebase()
+    await update.message.reply_text(text)
+ 
+ 
+async def cancel_zip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        return
+    uid = update.effective_user.id
+    had = False
+    job = zip_jobs.get(uid)
+    if job:
+        job["cancel"] = True
+        had = True
+    if zip_session.pop(uid, None) is not None:
+        had = True
+    if pending_zip.pop(uid, None) is not None:
+        had = True
+    await save_state_to_firebase()
+    await update.message.reply_text("🛑 ZIP cancel/clear ho gaya." if had else "ℹ️ Koi zip session active nahi hai.")
+ 
+ 
+async def collect_zip_video(update: Update, context: ContextTypes.DEFAULT_TYPE, file_obj, raw_name: str, ep_num):
+    msg = update.message
+    uid = update.effective_user.id
+    sess = zip_session[uid]
+ 
+    if uid in zip_jobs:
+        await msg.reply_text("⏳ Zip ban raha hai, abhi naye video mat bhejo. Khatam hone ke baad /zip se dobara shuru karo.")
+        return
+    if not is_video_media(msg):
+        await msg.reply_text("⚠️ Ye video nahi hai, skip kar diya.")
+        return
+ 
+    uniq = file_obj.file_unique_id
+    if any(v.get("uniq") == uniq for v in sess["videos"]):
+        await msg.reply_text("♻️ Ye video pehle se add hai, skip kiya.")
+        return
+ 
+    ext = get_extension(raw_name, fallback="mp4" if msg.video else "mkv")
+    sess["videos"].append({
+        "fid"  : file_obj.file_id,
+        "uniq" : uniq,
+        "name" : raw_name,
+        "size" : file_obj.file_size or 0,
+        "ep"   : ep_num,
+        "q"    : extract_zip_quality(msg.caption or "", raw_name),
+        "ext"  : ext,
+        "n"    : len(sess["videos"]),
+    })
+    count = len(sess["videos"])
+    total = sum(v["size"] for v in sess["videos"])
+    text = f"📥 {count} video collected • {human_size(total)}\nSab bhej do to /done likho."
+ 
+    now = time.time()
+    if not sess.get("status_msg_id"):
+        m = await msg.reply_text(text)
+        sess["status_msg_id"] = m.message_id
+        sess["last_edit"] = now
+    elif now - sess.get("last_edit", 0) >= 2:
+        try:
+            await context.bot.edit_message_text(chat_id=msg.chat_id, message_id=sess["status_msg_id"], text=text)
+        except Exception:
+            pass
+        sess["last_edit"] = now
+    await save_state_to_firebase()
+ 
+ 
+async def done_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        return
+    uid = update.effective_user.id
+    sess = zip_session.get(uid)
+    setup = user_setup.get(uid)
+    if not setup:
+        await update.message.reply_text("⚠️ Pehle /setup <anime-slug> <season> karo.")
+        return
+    if not sess or not sess.get("videos"):
+        await update.message.reply_text("⚠️ Koi video collect nahi hua. Pehle /zip karo, phir videos forward karo.")
+        return
+    if uid in zip_jobs:
+        await update.message.reply_text("⏳ Zip pehle se ban raha hai.")
+        return
+    zip_jobs[uid] = {"cancel": False}
+    zip_jobs[uid]["task"] = asyncio.create_task(
+        run_zip_job(context.bot, update.effective_chat.id, uid, dict(setup))
+    )
+ 
+ 
+# ── PROFESSIONAL PROGRESS DASHBOARD ───────────────────
+ 
+def fmt_dur(sec) -> str:
+    if sec is None or sec != sec or sec < 0:
+        return "calculating…"
+    sec = int(sec)
+    h, r = divmod(sec, 3600)
+    m, s = divmod(r, 60)
+    if h:
+        return f"{h}h {m:02d}m"
+    if m:
+        return f"{m}m {s:02d}s"
+    return f"{s}s"
+ 
+ 
+def fmt_speed(bps: float) -> str:
+    return f"{bps / 1048576:.1f} MB/s" if bps else "—"
+ 
+ 
+def make_bar(pct: float, width: int = 14) -> str:
+    pct = max(0.0, min(100.0, pct))
+    filled = int(width * pct / 100)
+    return "█" * filled + "░" * (width - filled)
+ 
+ 
+class _Speed:
+    """Smoothed (EMA) speed meter."""
+ 
+    def __init__(self):
+        self.reset()
+ 
+    def reset(self):
+        self.ema, self.t, self.b = 0.0, None, 0
+ 
+    def feed(self, cum_bytes: int):
+        now = time.time()
+        if self.t is None:
+            self.t, self.b = now, cum_bytes
+            return
+        dt = now - self.t
+        if dt >= 1.0:
+            inst = (cum_bytes - self.b) / dt
+            self.ema = inst if self.ema == 0 else 0.3 * inst + 0.7 * self.ema
+            self.t, self.b = now, cum_bytes
+ 
+ 
+class ZipProgress:
+    def __init__(self, slug: str, season: str, total_bytes: int, n_videos: int, n_parts: int):
+        self.slug, self.season = slug, season
+        self.total_bytes = max(total_bytes, 1)
+        self.n_videos, self.n_parts = n_videos, n_parts
+        self.started = time.time()
+        self.dl_done = self.up_done = self.up_base = 0
+        self.dl_speed, self.up_speed = _Speed(), _Speed()
+        self.phase = "zip"
+        self.part_no = 1
+        self.vid_i = self.vid_n = 0
+        self.name = ""
+        self.part_total = self.part_done = 0
+ 
+    def start_part(self, p_no: int, vids: list):
+        self.part_no, self.vid_n, self.vid_i = p_no, len(vids), 1
+        self.part_total = sum(v.get("size", 0) for v in vids) or 1
+        self.part_done = 0
+        self.phase = "zip"
+        self.dl_speed.reset()
+ 
+    def set_video(self, i: int, name: str):
+        self.vid_i, self.name = i, name
+ 
+    def add_dl(self, n: int):
+        self.dl_done += n
+        self.part_done += n
+        self.dl_speed.feed(self.dl_done)
+ 
+    def start_upload(self, part_bytes: int):
+        self.phase = "upload"
+        self.part_done, self.part_total = 0, max(part_bytes, 1)
+        self.up_base = self.up_done
+        self.up_speed.reset()
+ 
+    def set_upload(self, cur: int, total: int):
+        self.part_done = cur
+        self.part_total = total or self.part_total
+        self.up_done = self.up_base + cur
+        self.up_speed.feed(self.up_done)
+ 
+    def finish_part(self):
+        self.up_done = self.up_base + self.part_total
+ 
+    def eta(self):
+        dl_rate = self.dl_speed.ema
+        up_rate = self.up_speed.ema or dl_rate
+        if not dl_rate:
+            return None
+        rem_dl = max(self.total_bytes - self.dl_done, 0)
+        rem_up = max(self.total_bytes - self.up_done, 0)
+        return rem_dl / dl_rate + (rem_up / up_rate if up_rate else 0)
+ 
+    def render(self) -> str:
+        overall = (self.dl_done + self.up_done) * 100 / (2 * self.total_bytes)
+        part_pct = self.part_done * 100 / self.part_total if self.part_total else 0
+        elapsed = time.time() - self.started
+        if self.phase == "zip":
+            stages = "🔄 Zipping  ➜  ⚪ Upload  ➜  ⚪ Link"
+            verb, speed = "⬇️ Download + Zip", self.dl_speed.ema
+        else:
+            stages = "✅ Zipping  ➜  🔄 Upload  ➜  ⚪ Link"
+            verb, speed = "⬆️ Upload to Storage", self.up_speed.ema
+ 
+        lines = [
+            f"📦 ZIP BUILDER — {self.slug} • {self.season}",
+            "━━━━━━━━━━━━━━━━━━━━━━",
+            f"📊 Overall   {make_bar(overall)}  {overall:.0f}%",
+            f"⏱ Elapsed {fmt_dur(elapsed)}   •   ⏳ ETA {fmt_dur(self.eta())}",
+            "",
+            f"🧩 Part {self.part_no}/{self.n_parts}"
+            + (f"   •   🎞 Video {self.vid_i}/{self.vid_n}" if self.phase == "zip" else ""),
+        ]
+        if self.phase == "zip" and self.name:
+            lines.append(f"📄 {self.name}")
+        lines += [
+            stages,
+            "",
+            f"{verb}",
+            f"{make_bar(part_pct)}  {part_pct:.0f}%",
+            f"💾 {human_size(self.part_done) or '0 MB'} / {human_size(self.part_total)}",
+            f"⚡ Speed: {fmt_speed(speed)}",
+            "━━━━━━━━━━━━━━━━━━━━━━",
+            "🛑 Cancel: /cancelzip",
+        ]
+        return "\n".join(lines)
+ 
+    def final_text(self, total_zip_bytes: int) -> str:
+        elapsed = time.time() - self.started
+        return (
+            f"📦 ZIP BUILDER — {self.slug} • {self.season}\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📊 Overall   {make_bar(100)}  100%\n"
+            "✅ Zipping  ➜  ✅ Upload  ➜  ✅ Link\n\n"
+            f"🎉 Complete!\n"
+            f"🧩 Parts: {self.n_parts}   •   🎞 Videos: {self.n_videos}\n"
+            f"💾 Total size: {human_size(total_zip_bytes)}\n"
+            f"⏱ Total time: {fmt_dur(elapsed)}\n"
+            "━━━━━━━━━━━━━━━━━━━━━━"
+        )
+ 
+ 
+async def build_zip_part(job: dict, sm: StatusMsg, prog: ZipProgress, vids: list, zip_path: str, setup: dict):
+    used: set = set()
+    prog.start_part(prog.part_no, vids)
+    await sm.update(prog.render(), force=True)
+    zf = zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_STORED, allowZip64=True)
+    try:
+        for i, v in enumerate(vids, 1):
+            arc = zip_arcname(v, setup, used)
+            prog.set_video(i, arc)
+            zi = zipfile.ZipInfo(arc, date_time=time.localtime()[:6])
+            zi.compress_type = zipfile.ZIP_STORED
+            dest = zf.open(zi, "w", force_zip64=True)
+            try:
+                size = v.get("size", 0)
+                idx = written = 0
+                while True:
+                    if job["cancel"]:
+                        raise ZipCancelled()
+                    data = await fetch_segment(v["fid"], idx, ZIP_SEG_CHUNKS)
+                    if not data:
+                        break
+                    await run_blocking(dest.write, data)
+                    written += len(data)
+                    idx += ZIP_SEG_CHUNKS
+                    prog.add_dl(len(data))
+                    await sm.update(prog.render())
+                    if size and written >= size:
+                        break
+                if size and written != size:
+                    raise RuntimeError(f"{arc}: download adhura reh gaya ({written}/{size} bytes)")
+            finally:
+                dest.close()
+    finally:
+        zf.close()
+ 
+ 
+async def upload_zip_part(job: dict, sm: StatusMsg, prog: ZipProgress, zip_path: str, zip_name: str, caption: str) -> int:
+    prog.start_upload(os.path.getsize(zip_path))
+    await sm.update(prog.render(), force=True)
+ 
+    async def progress(current, total):
+        if job["cancel"]:
+            raise StopTransmission
+        prog.set_upload(current, total)
+        await sm.update(prog.render())
+ 
+    sent = await pyro.send_document(
+        chat_id=STORAGE_CHANNEL,
+        document=zip_path,
+        file_name=zip_name,
+        caption=caption,
+        force_document=True,
+        progress=progress,
+    )
+    if sent is None:
+        raise ZipCancelled()
+    return getattr(sent, "id", None) or sent.message_id
+ 
+ 
+async def run_zip_job(bot, chat_id: int, uid: int, setup: dict):
+    job = zip_jobs[uid]
+    sess = zip_session.get(uid) or {"videos": []}
+    tmp_dir = None
+    try:
+        videos = sorted(sess["videos"], key=zip_video_sort_key)
+        limit = ZIP_PART_MB * 1024 * 1024
+        too_big = [v for v in videos if v.get("size", 0) > limit]
+        if too_big:
+            names = "\n".join(f"• {v.get('name') or v['uniq']} ({human_size(v['size'])})" for v in too_big)
+            await bot.send_message(chat_id, f"❌ Ye video ZIP part limit ({ZIP_PART_MB} MB) se bade hain:\n{names}\n\nInhe hata kar dobara /done karo.")
+            return
+ 
+        parts = plan_zip_parts(videos, limit)
+        qs = [v.get("q") for v in videos if v.get("q")]
+        quality = qs[0] if qs and len(set(qs)) == 1 else None
+ 
+        status_msg = await bot.send_message(
+            chat_id,
+            f"📦 {len(videos)} video • {len(parts)} ZIP part banenge\n⏳ Shuru ho raha hai...",
+        )
+        sm = StatusMsg(bot, chat_id, status_msg.message_id)
+        prog = ZipProgress(setup["slug"], setup["season"], sum(v.get("size", 0) for v in videos), len(videos), len(parts))
+        tmp_dir = tempfile.mkdtemp(prefix="zipjob_", dir=ZIP_TMP_DIR)
+ 
+        results = []
+        for p_no, vids in enumerate(parts, 1):
+            hint = part_ep_hint(vids)
+            q_tag = f"-{quality}" if quality else ""
+            if hint:
+                r_tag = f"-EP{hint[0]}" if hint[0] == hint[1] else f"-EP{hint[0]}-{hint[1]}"
+            elif len(parts) > 1:
+                r_tag = f"-part{p_no}"
+            else:
+                r_tag = ""
+            zip_name = f"{setup['slug']}-{setup['season']}{r_tag}-ZIP{q_tag}.zip"
+            zip_path = os.path.join(tmp_dir, zip_name)
+ 
+            prog.part_no = p_no
+            await build_zip_part(job, sm, prog, vids, zip_path, setup)
+            size_bytes = os.path.getsize(zip_path)
+            caption = f"📦 {setup['slug']} {setup['season']} ZIP" + (f" • {fmt_ep_range(*hint)}" if hint else "")
+            msg_id = await upload_zip_part(job, sm, prog, zip_path, zip_name, caption)
+            prog.finish_part()
+            try:
+                os.remove(zip_path)
+            except OSError:
+                pass
+ 
+            results.append({
+                "msg_id"   : msg_id,
+                "name"     : zip_name,
+                "link"     : make_download_link(msg_id, zip_name),
+                "size_text": human_size(size_bytes),
+                "size_bytes": size_bytes,
+                "count"    : len(vids),
+                "hint"     : hint,
+            })
+ 
+        zip_session.pop(uid, None)
+        pending_zip[uid] = {
+            "slug": setup["slug"], "season": setup["season"],
+            "quality": quality, "idx": 0, "parts": results,
+        }
+        await save_state_to_firebase()
+        await sm.update(prog.final_text(sum(r["size_bytes"] for r in results)), force=True)
+ 
+        lines = []
+        for i, r in enumerate(results, 1):
+            lines.append(
+                f"📦 *Part {i}/{len(results)}* — {r['count']} video • {r['size_text']}\n"
+                f"⬇️ `{r['link']}`"
+            )
+        await bot.send_message(chat_id, "🎉 *ZIP Secured!*\n\n" + "\n\n".join(lines), parse_mode="Markdown")
+        await ask_zip_question(bot, chat_id, uid)
+ 
+    except ZipCancelled:
+        await bot.send_message(chat_id, "🛑 ZIP cancel ho gaya.")
+    except Exception as e:
+        logger.error(f"run_zip_job error: {e}", exc_info=True)
+        await bot.send_message(
+            chat_id,
+            f"❌ ZIP banate waqt error aaya:\n{e}\n\nCollected videos safe hain — /done se dobara try kar sakte ho.",
+        )
+    finally:
+        if tmp_dir:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        zip_jobs.pop(uid, None)
+ 
+ 
+async def ask_zip_question(bot, chat_id: int, uid: int):
+    pend = pending_zip.get(uid)
+    if not pend:
+        return
+    if not pend.get("quality"):
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("480p", callback_data="zq:480p"),
+            InlineKeyboardButton("720p", callback_data="zq:720p"),
+            InlineKeyboardButton("1080p", callback_data="zq:1080p"),
+        ]])
+        await bot.send_message(chat_id, "🎞️ Is ZIP ki quality konsi hai?", reply_markup=kb)
+        return
+ 
+    n = len(pend["parts"])
+    part = pend["parts"][pend["idx"]]
+    hint = part.get("hint")
+    rows = []
+    if hint:
+        rows.append([InlineKeyboardButton(f"✅ {fmt_ep_range(*hint)} (detected)", callback_data="zr:use")])
+    if n == 1:
+        rows.append([InlineKeyboardButton("📚 Full Season", callback_data="zr:full")])
+    rows.append([InlineKeyboardButton("⏭️ Skip (save mat karo)", callback_data="zr:skip")])
+ 
+    head = f"Part {pend['idx'] + 1}/{n}" if n > 1 else "Ye ZIP"
+    await bot.send_message(
+        chat_id,
+        f"❓ {head} ({part['count']} video, {part['size_text']}, {pend['quality']}) konsa episode / range me save karu?\n\n"
+        f"✍️ Type karo:\n"
+        f"• Single episode: 5\n"
+        f"• Range: 1-12  (ya 13 se 24)\n"
+        f"• Poora season: full" + ("  (multi-part me allowed nahi)" if n > 1 else ""),
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+ 
+ 
+async def commit_zip_part(bot, chat_id: int, uid: int, ep_range=None, skip: bool = False):
+    pend = pending_zip.get(uid)
+    if not pend:
+        return
+    part = pend["parts"][pend["idx"]]
+    n = len(pend["parts"])
+    label = f"Part {pend['idx'] + 1}/{n}" if n > 1 else "ZIP"
+ 
+    if skip:
+        await bot.send_message(chat_id, f"⏭️ {label} Firebase me save nahi kiya.")
+    else:
+        saved = await save_zip_to_firebase(
+            pend["slug"], pend["season"], pend["quality"], part["link"], part["size_text"],
+            tuple(ep_range) if ep_range else None,
+        )
+        rtxt = fmt_ep_range(*ep_range) if ep_range else "Full Season"
+        status = "✅ Firebase me save ho gaya" if saved else "⚠️ Firebase save fail — link manually daalna padega"
+        await bot.send_message(
+            chat_id,
+            f"📦 {label} saved\n🎌 {pend['slug']} {pend['season']} • {pend['quality']}\n🔢 {rtxt}\n{status}",
+        )
+ 
+    pend["idx"] += 1
+    if pend["idx"] >= n:
+        pending_zip.pop(uid, None)
+        await save_state_to_firebase()
+        await bot.send_message(chat_id, "🏁 Sab ZIP process ho gaye. Naya batch karna ho to /zip likho.")
+    else:
+        await save_state_to_firebase()
+        await ask_zip_question(bot, chat_id, uid)
+ 
+ 
+async def zip_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    uid = q.from_user.id
+    if not is_allowed(uid):
+        await q.answer()
+        return
+    pend = pending_zip.get(uid)
+    if not pend:
+        await q.answer("Koi pending zip nahi hai.", show_alert=True)
+        return
+    await q.answer()
+    try:
+        await q.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+ 
+    chat_id = q.message.chat_id
+    data = q.data or ""
+    if data.startswith("zq:"):
+        pend["quality"] = data[3:]
+        await save_state_to_firebase()
+        await ask_zip_question(context.bot, chat_id, uid)
+        return
+    if not pend.get("quality"):
+        await ask_zip_question(context.bot, chat_id, uid)
+        return
+ 
+    part = pend["parts"][pend["idx"]]
+    if data == "zr:use" and part.get("hint"):
+        await commit_zip_part(context.bot, chat_id, uid, ep_range=part["hint"])
+    elif data == "zr:full" and len(pend["parts"]) == 1:
+        await commit_zip_part(context.bot, chat_id, uid, ep_range=None)
+    elif data == "zr:skip":
+        await commit_zip_part(context.bot, chat_id, uid, skip=True)
+ 
+ 
+_SINGLE_EP_RE = re.compile(r'(?:ep(?:isode)?|e)?\s*[-:.]?\s*(\d{1,4})')
+ 
+ 
+async def handle_zip_text_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Pending ZIP ka text jawab (quality / episode / range). True = message consume ho gaya."""
+    uid = update.effective_user.id
+    pend = pending_zip.get(uid)
+    if not pend:
+        return False
+    msg = update.message
+    text = (msg.text or "").strip()
+    if URL_RE.search(text):
+        return False  # direct-link flow ko chhodo
+ 
+    low = text.lower()
+    q = extract_zip_quality(text)
+    if not q and not pend.get("quality"):
+        m = re.fullmatch(r'(1080|720|480)p?', low)
+        if m:
+            q = f"{m.group(1)}p"
+    if q:
+        pend["quality"] = q
+        await save_state_to_firebase()
+ 
+    cleaned = _QUALITY_STRIP_RE.sub(" ", text).strip()
+    low = cleaned.lower()
+ 
+    if not pend.get("quality"):
+        await ask_zip_question(context.bot, msg.chat_id, uid)
+        return True
+    if not low:
+        await ask_zip_question(context.bot, msg.chat_id, uid)
+        return True
+ 
+    if low in ("skip", "cancel"):
+        await commit_zip_part(context.bot, msg.chat_id, uid, skip=True)
+        return True
+    if low in ("full", "all", "season", "full season", "poora", "pura"):
+        if len(pend["parts"]) > 1:
+            await msg.reply_text("⚠️ Multi-part ZIP me 'full' allowed nahi, har part ki range batao (jaise 1-12).")
+            return True
+        await commit_zip_part(context.bot, msg.chat_id, uid, ep_range=None)
+        return True
+ 
+    rng = extract_ep_range(cleaned)
+    if rng:
+        await commit_zip_part(context.bot, msg.chat_id, uid, ep_range=list(rng))
+        return True
+    m = _SINGLE_EP_RE.fullmatch(low)
+    if m:
+        ep = int(m.group(1))
+        await commit_zip_part(context.bot, msg.chat_id, uid, ep_range=[ep, ep])
+        return True
+ 
+    await msg.reply_text("⚠️ Samajh nahi aaya. Aise likho: 5   ya   1-12   ya   full   ya   skip")
+    return True
+ 
+ 
 # ── BOT HANDLERS ──────────────────────────────────────
-
+ 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         await update.message.reply_text("⛔ Unauthorized.")
@@ -488,17 +1239,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📌 *Setup karo:*\n`/setup <anime-slug> <season>`\n"
         "_Example: /setup attack-on-titan 1_\n\n"
         "Phir video forward karo — caption mein episode number hona chahiye.\n"
-        "Bot automatically filename aur secured links banayega! 🚀",
+        "Bot automatically filename aur secured links banayega! 🚀\n\n"
+        "📦 *Multi-video ZIP mode:*\n"
+        "`/setup <anime-slug> <season> zip` → videos forward karo → `/done`\n"
+        "Bot ZIP bana ke storage me daalega, link dega aur puchega kis episode/range me save karna hai.\n"
+        "Cancel: `/cancelzip`",
         parse_mode="Markdown",
     )
-
-
+ 
+ 
 async def setup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         return
     args = context.args
     if len(args) < 2:
-        await update.message.reply_text("❌ *Usage:* `/setup <anime-slug> <season-number>`\n\n", parse_mode="Markdown")
+        await update.message.reply_text("❌ *Usage:* `/setup <anime-slug> <season-number> [zip]`\n\n", parse_mode="Markdown")
         return
     slug = args[0].lower().strip()
     raw_season = args[1].strip()
@@ -506,22 +1261,38 @@ async def setup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         season = f"S{raw_season}"
     else:
         season = raw_season.upper()
-
-    user_setup[update.effective_user.id] = {"slug": slug, "season": season}
+ 
+    uid = update.effective_user.id
+    user_setup[uid] = {"slug": slug, "season": season}
+    if uid not in zip_jobs:
+        zip_session.pop(uid, None)  # naya setup = purana adhura collect hata do
+    zip_text = ""
+    if len(args) >= 3 and args[2].lower() in ("zip", "zipmode"):
+        _, zip_text = start_zip_mode(uid)
     await save_state_to_firebase()
-    await update.message.reply_text(f"✅ *Setup Saved for AnimeVerse!*\n\n🎌 *Anime Slug:* `{slug}`\n📺 *Season:* `{season}`", parse_mode="Markdown")
-
-
+    if zip_text:
+        await update.message.reply_text(
+            f"✅ Setup Saved for AnimeVerse!\n\n🎌 Anime Slug: {slug}\n📺 Season: {season}\n\n{zip_text}"
+        )
+    else:
+        await update.message.reply_text(
+            f"✅ *Setup Saved for AnimeVerse!*\n\n🎌 *Anime Slug:* `{slug}`\n📺 *Season:* `{season}`",
+            parse_mode="Markdown",
+        )
+ 
+ 
 async def clear_setup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         return
     uid = update.effective_user.id
     user_setup.pop(uid, None)
     quality_buffer.pop(uid, None)
+    zip_session.pop(uid, None)
+    pending_zip.pop(uid, None)
     await save_state_to_firebase()
     await update.message.reply_text("🗑️ Setup clear ho gaya.", parse_mode="Markdown")
-
-
+ 
+ 
 async def current_setup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         return
@@ -530,11 +1301,13 @@ async def current_setup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Koi setup nahi hai.", parse_mode="Markdown")
         return
     await update.message.reply_text(f"📋 *Current Setup:*\n🎌 *Anime:* `{setup['slug']}`\n📺 *Season:* `{setup['season']}`", parse_mode="Markdown")
-
-
+ 
+ 
+ 
+ 
 # ── VIDEO DETAILS (sirf info batata hai, kuch change/convert nahi karta) ──
 VIDEO_INFO = os.getenv("VIDEO_INFO", "1") != "0"   # 0 = details band
-_probe_lock = asyncio.Semaphore(1)                 # ek time pe ek hi ffprrobe
+_probe_lock = asyncio.Semaphore(1)                 # ek time pe ek hi ffprobe
  
 CODEC_NAMES = {
     "h264": "H.264", "hevc": "H.265 (HEVC)", "av1": "AV1", "vp9": "VP9", "vp8": "VP8",
@@ -647,12 +1420,12 @@ async def get_video_details(storage_msg_id: int, ext: str):
     }
  
  
-def format_details(d: dict) -> str:
-    """Poori details (Markdown)."""
+def format_details(d: dict, header: str = "📋 *Video Details*") -> str:
+    """Poori details (Markdown). header=None ho to heading nahi lagti (report ke liye)."""
     if not d:
         return ""
     vname = CODEC_NAMES.get(d["vcodec"], d["vcodec"].upper())
-    L = ["📋 *Video Details*"]
+    L = [header] if header else []
     L.append(f"📄 Extension: `.{_md(d['ext'])}`")
     L.append(f"📦 Container: {_md(d['container'])}")
     if d["duration"]:
@@ -678,6 +1451,46 @@ def format_details(d: dict) -> str:
     else:
         L.append("✅ Browser mein chalegi (H.264 + AAC + MP4)")
     return "\n".join(L)
+ 
+ 
+async def send_episode_report(msg, setup: dict, ep_num, items: list):
+    """3 quality ke links dene ke BAAD ek report: teeno files ki details ek message mein."""
+    if not VIDEO_INFO or not shutil.which("ffprobe"):
+        return
+    wait = None
+    try:
+        wait = await msg.reply_text("📊 Teeno files ki report taiyar ho rahi hai...")
+        blocks, marks, got_any = [], [], False
+        for it in sorted(items, key=lambda x: quality_sort_key(x["quality"]), reverse=True):
+            d = await get_video_details(it["sid"], it["ext"])
+            head = f"🎬 *{it['quality']}* — {it['size_mb']} MB"
+            if d:
+                got_any = True
+                blocks.append(head + "\n" + format_details(d, header=None))
+                marks.append(f"{it['quality']} {'⚠️' if d['issues'] else '✅'}")
+            else:
+                blocks.append(head + "\n⚠️ Details nahi mil saki")
+                marks.append(f"{it['quality']} ❔")
+        if not got_any:
+            await wait.delete()
+            return
+        text = (f"📊 *Episode Report*\n🎌 `{setup['slug']}` · Season {setup['season']} · Episode {ep_num}\n\n"
+                + "\n\n".join(blocks)
+                + "\n\n📌 *Summary:* " + "  |  ".join(marks)
+                + "\n(✅ browser mein chalegi, ⚠️ shayad na chale)")
+        if len(text) <= 4000:
+            await wait.edit_text(text, parse_mode="Markdown")
+        else:
+            await wait.delete()
+            for i in range(0, len(text), 3900):
+                await msg.reply_text(text[i:i + 3900], parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"send_episode_report error: {e}")
+        if wait:
+            try:
+                await wait.delete()
+            except Exception:
+                pass
  
  
 async def send_details(msg, storage_msg_id: int, ext: str):
@@ -720,6 +1533,10 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
  
     setup = user_setup.get(uid)
     if setup:
+        # ZIP MODE ON: videos sirf collect honge, /done par zip banega
+        if uid in zip_session:
+            await collect_zip_video(update, context, file_obj, raw_name, ep_num)
+            return
         # ZIP file (poora season) — episode flow se alag handle hota hai
         if is_zip_file(msg, raw_name):
             await handle_zip_upload(msg, context, setup, file_obj, raw_name)
@@ -746,7 +1563,6 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
  
             if collected < QUALITY_COUNT:
                 await msg.reply_text(f"✅ *Video {collected}/{QUALITY_COUNT} mila!*", parse_mode="Markdown")
-                await send_details(msg, storage_msg_id, ext)
                 return
  
             videos = quality_buffer[uid][ep_num]
@@ -761,7 +1577,7 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 embed_link = make_embed_link(vid["sid"], filename)
  
                 fb_saved = await save_to_firebase_with_retry(setup["slug"], setup["season"], ep_num, stream_link, quality, download_link)
-                results.append({"quality": quality, "link": stream_link, "dl_link": download_link, "embed_link": embed_link, "size_mb": round(vid["size"] / (1024*1024), 2), "saved": fb_saved})
+                results.append({"quality": quality, "sid": vid["sid"], "ext": vid["ext"], "link": stream_link, "dl_link": download_link, "embed_link": embed_link, "size_mb": round(vid["size"] / (1024*1024), 2), "saved": fb_saved})
  
             del quality_buffer[uid][ep_num]
             await save_state_to_firebase()
@@ -771,7 +1587,7 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 for r in sorted(results, key=lambda x: quality_sort_key(x["quality"]), reverse=True)
             ])
             await msg.reply_text(f"🎉 *Teeno Quality Secured & Saved!*\n\n🎌 *Anime:* `{setup['slug']}`\n{quality_lines}", parse_mode="Markdown")
-            await send_details(msg, storage_msg_id, ext)  # aakhri (3rd) video ki details
+            await send_episode_report(msg, setup, ep_num, results)  # teeno ki details ek report mein
         except Exception as e:
             logger.error(f"handle_media error: {e}")
             try:
@@ -1039,6 +1855,10 @@ async def run_bot():
     app.add_handler(CommandHandler("setup",       setup_cmd))
     app.add_handler(CommandHandler("mysetup",     current_setup_cmd))
     app.add_handler(CommandHandler("clearsetup",  clear_setup_cmd))
+    app.add_handler(CommandHandler("zip",         zip_cmd))
+    app.add_handler(CommandHandler("done",        done_cmd))
+    app.add_handler(CommandHandler("cancelzip",   cancel_zip_cmd))
+    app.add_handler(CallbackQueryHandler(zip_callback, pattern=r"^z[qr]:"))
     app.add_handler(CommandHandler("getlink",     get_link_cmd))
     app.add_handler(MessageHandler(filters.VIDEO | filters.Document.ALL | filters.AUDIO | filters.VIDEO_NOTE, handle_media))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_link))
