@@ -553,8 +553,10 @@ async def ensure_compatible(processing, storage_msg_id: int, raw_name: str, ext:
         except Exception:
             pass
  
+        logger.info(f"[fix] msg {storage_msg_id}: probe start ({ext}, {file_size} bytes)")
         info = await media_fix.probe(url)
         plan = media_fix.analyze(info) if info else None
+        logger.info(f"[fix] msg {storage_msg_id}: plan = {plan.mode if plan else 'NONE (analyze fail)'}")
         if plan is None:
             default["note"] = "⚠️ Analyze nahi ho saki — original as-is store hui"
             return default
@@ -580,6 +582,7 @@ async def ensure_compatible(processing, storage_msg_id: int, raw_name: str, ext:
  
         async with media_fix.convert_lock:
             ui.queued = False
+            logger.info(f"[fix] msg {storage_msg_id}: pipeline start (mode={plan.mode})")
             await ui.start()
             try:
                 sent = await media_fix.run_pipeline(
@@ -592,6 +595,7 @@ async def ensure_compatible(processing, storage_msg_id: int, raw_name: str, ext:
                 default["note"] = "❌ Convert fail hua — original as-is store hui"
                 return default
             await ui.stop(footer="🎉 Complete!")
+            logger.info(f"[fix] msg {storage_msg_id}: pipeline done -> new msg {sent.id}")
  
         try:
             await pyro.delete_messages(STORAGE_CHANNEL, storage_msg_id)  # purani (incompatible) copy hatao
