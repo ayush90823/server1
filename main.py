@@ -1,14 +1,15 @@
 import os
 import re
 import hashlib
+import json
 import mimetypes
+import shutil
 import hmac
 from html import escape as html_escape
 import logging
 import urllib.parse
 import asyncio
 import math
-import shutil
 import time
 from collections import OrderedDict
 from contextlib import asynccontextmanager
@@ -23,8 +24,6 @@ from pyrogram import Client
 from pyrogram.errors import FloodWait
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import RetryAfter
-
-import media_fix
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -533,80 +532,162 @@ async def current_setup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"📋 *Current Setup:*\n🎌 *Anime:* `{setup['slug']}`\n📺 *Season:* `{setup['season']}`", parse_mode="Markdown")
 
 
-async def ensure_compatible(processing, storage_msg_id: int, raw_name: str, ext: str, file_size: int, mime: str = "") -> dict:
-    """
-    Storage mein gayi video ko check karta hai. Browser-compatible hai to kuch nahi karta.
-    Nahi hai to plan dikhata hai, convert karke naya message banata hai, purana delete karta hai.
-    Hamesha dict return karta hai: {sid, ext, size, note}. Fail hone par original as-is rehti hai.
-    """
-    default = {"sid": storage_msg_id, "ext": ext, "size": file_size, "note": ""}
+# ── VIDEO DETAILS (sirf info batata hai, kuch change/convert nahi karta) ──
+VIDEO_INFO = os.getenv("VIDEO_INFO", "1") != "0"   # 0 = details band
+_probe_lock = asyncio.Semaphore(1)                 # ek time pe ek hi ffprrobe
+ 
+CODEC_NAMES = {
+    "h264": "H.264", "hevc": "H.265 (HEVC)", "av1": "AV1", "vp9": "VP9", "vp8": "VP8",
+    "mpeg4": "MPEG-4", "mpeg2video": "MPEG-2", "vc1": "VC-1",
+    "aac": "AAC", "mp3": "MP3", "ac3": "AC3", "eac3": "E-AC3", "dts": "DTS",
+    "flac": "FLAC", "opus": "Opus", "vorbis": "Vorbis", "truehd": "TrueHD",
+    "ass": "ASS", "subrip": "SRT", "webvtt": "VTT", "mov_text": "mov_text", "hdmv_pgs_subtitle": "PGS",
+}
+ 
+ 
+def _md(text) -> str:
+    """Markdown tootne wale characters hata do."""
+    return re.sub(r"[_*`\[\]]", " ", str(text))
+ 
+ 
+def _mmss(sec: float) -> str:
+    sec = max(0, int(sec))
+    h_, rem = divmod(sec, 3600)
+    m, s_ = divmod(rem, 60)
+    return f"{h_}:{m:02d}:{s_:02d}" if h_ else f"{m:02d}:{s_:02d}"
+ 
+ 
+def _channels(n: int) -> str:
+    return {1: "mono", 2: "stereo", 6: "5.1", 8: "7.1"}.get(n, f"{n}ch" if n else "")
+ 
+ 
+async def get_video_details(storage_msg_id: int, ext: str):
+    """Storage mein padi video ki details ffprobe se nikalta hai (poori file download nahi hoti).
+    Kuch bhi fail ho to None return karta hai — bot ka baaki kaam nahi rukta."""
+    if not VIDEO_INFO or not shutil.which("ffprobe"):
+        return None
+    probe_name = f"probe.{ext}"
+    code = generate_code(storage_msg_id, probe_name)
+    url = f"http://127.0.0.1:{PORT}/animeverse/dl/{storage_msg_id}/{urllib.parse.quote(probe_name)}?code={code}"
     try:
-        if not (media_fix.AUTO_CONVERT and media_fix.tools_available() and media_fix.is_video_like(ext, mime)):
-            return default
- 
-        probe_name = f"probe.{ext}"
-        code = generate_code(storage_msg_id, probe_name)
-        url = f"http://127.0.0.1:{PORT}/animeverse/dl/{storage_msg_id}/{urllib.parse.quote(probe_name)}?code={code}"
- 
-        try:
-            await processing.edit_text("🔍 Video analyze ho rahi hai...")
-        except Exception:
-            pass
- 
-        logger.info(f"[fix] msg {storage_msg_id}: probe start ({ext}, {file_size} bytes)")
-        info = await media_fix.probe(url)
-        plan = media_fix.analyze(info) if info else None
-        logger.info(f"[fix] msg {storage_msg_id}: plan = {plan.mode if plan else 'NONE (analyze fail)'}")
-        if plan is None:
-            default["note"] = "⚠️ Analyze nahi ho saki — original as-is store hui"
-            return default
- 
-        if not plan.needs_work:
-            return {"sid": storage_msg_id, "ext": "mp4", "size": file_size, "note": plan.summary}
- 
-        display_name = raw_name or f"video.{ext}"
- 
-        if file_size and file_size > media_fix.MAX_PROCESS_BYTES:
-            default["note"] = "⚠️ Browser mein shayad na chale, par file bahut badi hai — as-is store hui"
-            return default
- 
-        os.makedirs(media_fix.WORK_DIR, exist_ok=True)
-        if shutil.disk_usage(media_fix.WORK_DIR).free < (file_size or 0) * 2.5:
-            default["note"] = "⚠️ Convert ke liye disk space kam hai — as-is store hui"
-            return default
- 
-        ui = media_fix.StatusUI(processing, display_name, file_size, plan)
-        if media_fix.convert_lock.locked():
-            ui.queued = True
-            await ui.push(force=True)
- 
-        async with media_fix.convert_lock:
-            ui.queued = False
-            logger.info(f"[fix] msg {storage_msg_id}: pipeline start (mode={plan.mode})")
-            await ui.start()
+        async with _probe_lock:
+            proc = await asyncio.create_subprocess_exec(
+                "ffprobe", "-v", "error", "-probesize", "8M", "-analyzeduration", "8M",
+                "-print_format", "json", "-show_format", "-show_streams", url,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
             try:
-                sent = await media_fix.run_pipeline(
-                    url=url, name=display_name, size=file_size, p=plan, ui=ui,
-                    pyro=pyro, chat_id=STORAGE_CHANNEL,
-                )
-            except Exception as e:
-                logger.error(f"convert failed for msg {storage_msg_id}: {e}")
-                await ui.stop(footer="❌ Convert fail hua — original video as-is store hui.")
-                default["note"] = "❌ Convert fail hua — original as-is store hui"
-                return default
-            await ui.stop(footer="🎉 Complete!")
-            logger.info(f"[fix] msg {storage_msg_id}: pipeline done -> new msg {sent.id}")
- 
-        try:
-            await pyro.delete_messages(STORAGE_CHANNEL, storage_msg_id)  # purani (incompatible) copy hatao
-        except Exception as e:
-            logger.warning(f"old storage msg delete nahi hua ({storage_msg_id}): {e}")
- 
-        final_size = getattr(getattr(sent, "video", None), "file_size", 0) or file_size
-        return {"sid": sent.id, "ext": "mp4", "size": final_size, "note": plan.summary}
+                out, err = await asyncio.wait_for(proc.communicate(), 60)
+            except asyncio.TimeoutError:
+                proc.kill()
+                logger.error(f"ffprobe timeout for msg {storage_msg_id}")
+                return None
+        if proc.returncode != 0:
+            logger.error(f"ffprobe failed for msg {storage_msg_id}: {err.decode(errors='ignore')[-200:]}")
+            return None
+        info = json.loads(out.decode() or "{}")
     except Exception as e:
-        logger.error(f"ensure_compatible error: {e}")
-        return default
+        logger.error(f"get_video_details error: {e}")
+        return None
+ 
+    streams = info.get("streams") or []
+    fmt = info.get("format") or {}
+    vs = [x for x in streams if x.get("codec_type") == "video" and not (x.get("disposition") or {}).get("attached_pic")]
+    aus = [x for x in streams if x.get("codec_type") == "audio"]
+    subs = [x for x in streams if x.get("codec_type") == "subtitle"]
+    if not vs:
+        return None
+    v = vs[0]
+ 
+    names = (fmt.get("format_name") or "").split(",")
+    container = "MP4" if "mp4" in names else ("MKV / WebM" if "matroska" in names else (names[0].upper() or "?"))
+    try:
+        duration = float(fmt.get("duration") or v.get("duration") or 0)
+    except ValueError:
+        duration = 0.0
+    try:
+        bitrate = int(fmt.get("bit_rate") or 0)
+    except ValueError:
+        bitrate = 0
+    fps = 0.0
+    try:
+        n, d = (v.get("r_frame_rate") or "0/1").split("/")
+        fps = float(n) / float(d) if float(d) else 0.0
+    except Exception:
+        pass
+ 
+    vcodec = (v.get("codec_name") or "").lower()
+    pix = (v.get("pix_fmt") or "").lower()
+    m = re.search(r"p(\d{2})(?:le|be)", pix)
+    depth = int(m.group(1)) if m else int(v.get("bits_per_raw_sample") or 8)
+ 
+    audios = []
+    for a in aus:
+        audios.append({
+            "codec": (a.get("codec_name") or "").lower(),
+            "ch": int(a.get("channels") or 0),
+            "lang": (a.get("tags") or {}).get("language", ""),
+        })
+ 
+    # Browser mein chalegi ya nahi
+    issues = []
+    if not (vcodec == "h264" and pix in ("yuv420p", "yuvj420p")):
+        issues.append(f"video {CODEC_NAMES.get(vcodec, vcodec.upper())}" + (f" {depth}-bit" if depth > 8 else ""))
+    if audios and audios[0]["codec"] not in ("aac", "mp3"):
+        issues.append(f"audio {CODEC_NAMES.get(audios[0]['codec'], audios[0]['codec'].upper())}")
+    if "mp4" not in names:
+        issues.append(f"container {container}")
+ 
+    return {
+        "ext": ext, "container": container, "duration": duration, "bitrate": bitrate,
+        "width": int(v.get("width") or 0), "height": int(v.get("height") or 0), "fps": fps,
+        "vcodec": vcodec, "vprofile": v.get("profile") or "", "depth": depth,
+        "audios": audios, "subs": [{"codec": (x.get("codec_name") or "").lower(), "lang": (x.get("tags") or {}).get("language", "")} for x in subs],
+        "issues": issues,
+    }
+ 
+ 
+def format_details(d: dict) -> str:
+    """Poori details (Markdown)."""
+    if not d:
+        return ""
+    vname = CODEC_NAMES.get(d["vcodec"], d["vcodec"].upper())
+    L = ["📋 *Video Details*"]
+    L.append(f"📄 Extension: `.{_md(d['ext'])}`")
+    L.append(f"📦 Container: {_md(d['container'])}")
+    if d["duration"]:
+        L.append(f"⏱ Duration: {_mmss(d['duration'])}")
+    if d["width"]:
+        L.append(f"📐 Resolution: {d['width']}x{d['height']}" + (f" @ {d['fps']:.2f} fps" if d["fps"] else ""))
+    vline = vname + (f" · {_md(d['vprofile'])}" if d["vprofile"] else "") + (f" · {d['depth']}-bit" if d["depth"] > 8 else "")
+    L.append(f"🎞 Video: {vline}")
+    if d["audios"]:
+        L.append(f"🔊 Audio ({len(d['audios'])} track):")
+        for i, a in enumerate(d["audios"], 1):
+            parts = [CODEC_NAMES.get(a["codec"], a["codec"].upper()), _channels(a["ch"]), _md(a["lang"])]
+            L.append(f"   {i}. " + " · ".join(x for x in parts if x))
+    else:
+        L.append("🔊 Audio: nahi hai")
+    if d["subs"]:
+        kinds = ", ".join(CODEC_NAMES.get(x["codec"], x["codec"].upper()) for x in d["subs"][:6])
+        L.append(f"💬 Subtitles ({len(d['subs'])}): {kinds}")
+    if d["bitrate"]:
+        L.append(f"📊 Bitrate: {d['bitrate'] / 1_000_000:.1f} Mbps")
+    if d["issues"]:
+        L.append("⚠️ Browser mein shayad na chale: " + ", ".join(_md(x) for x in d["issues"]))
+    else:
+        L.append("✅ Browser mein chalegi (H.264 + AAC + MP4)")
+    return "\n".join(L)
+ 
+ 
+async def send_details(msg, storage_msg_id: int, ext: str):
+    """Links dene ke BAAD alag message mein details bhejta hai (links kabhi ruk'te nahi)."""
+    try:
+        text = format_details(await get_video_details(storage_msg_id, ext))
+        if text:
+            await msg.reply_text(text, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"send_details error: {e}")
  
  
 async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -653,32 +734,19 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
             forwarded = await copy_with_floodwait(context, chat_id=STORAGE_CHANNEL, from_chat_id=msg.chat_id, message_id=msg.message_id)
             storage_msg_id = forwarded.message_id
  
-            fixed = await ensure_compatible(
-                processing, storage_msg_id,
-                raw_name or f"{setup['slug']}-{setup['season']}-E{ep_num}.{ext}",
-                ext, file_size, getattr(file_obj, "mime_type", "") or "",
-            )
- 
             if uid not in quality_buffer:
                 quality_buffer[uid] = {}
             if ep_num not in quality_buffer[uid]:
                 quality_buffer[uid][ep_num] = []
  
-            # size = original size (quality order ke liye), final_size = convert ke baad ki size
-            quality_buffer[uid][ep_num].append({
-                "size": file_size, "sid": fixed["sid"], "ext": fixed["ext"],
-                "note": fixed["note"], "final_size": fixed["size"],
-            })
-            collected = len(quality_buffer[uid][ep_num])  # await se pehle — concurrent handlers mein race na ho
+            quality_buffer[uid][ep_num].append({"size": file_size, "sid": storage_msg_id, "ext": ext})
             await save_state_to_firebase()
+            collected = len(quality_buffer[uid][ep_num])
             await processing.delete()
  
             if collected < QUALITY_COUNT:
-                note_line = f"\n{fixed['note']}" if fixed["note"] else ""
-                await msg.reply_text(f"✅ *Video {collected}/{QUALITY_COUNT} mila!*{note_line}", parse_mode="Markdown")
-                return
-            if collected > QUALITY_COUNT:
-                await msg.reply_text(f"⚠️ Is episode ke liye {QUALITY_COUNT} videos pehle se aa chuki hain.")
+                await msg.reply_text(f"✅ *Video {collected}/{QUALITY_COUNT} mila!*", parse_mode="Markdown")
+                await send_details(msg, storage_msg_id, ext)
                 return
  
             videos = quality_buffer[uid][ep_num]
@@ -693,16 +761,17 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 embed_link = make_embed_link(vid["sid"], filename)
  
                 fb_saved = await save_to_firebase_with_retry(setup["slug"], setup["season"], ep_num, stream_link, quality, download_link)
-                results.append({"quality": quality, "link": stream_link, "dl_link": download_link, "embed_link": embed_link, "size_mb": round((vid.get("final_size") or vid["size"]) / (1024*1024), 2), "note": vid.get("note", ""), "saved": fb_saved})
+                results.append({"quality": quality, "link": stream_link, "dl_link": download_link, "embed_link": embed_link, "size_mb": round(vid["size"] / (1024*1024), 2), "saved": fb_saved})
  
             del quality_buffer[uid][ep_num]
             await save_state_to_firebase()
  
             quality_lines = "\n".join([
-                f"  *{r['quality']}* — {r['size_mb']} MB{(chr(10) + '  ' + r['note']) if r['note'] else ''}\n  ▶️ Stream: `{r['link']}`\n  🖼️ Embed: `{r['embed_link']}`\n  ⬇️ Download: `{r['dl_link']}`"
+                f"  *{r['quality']}* — {r['size_mb']} MB\n  ▶️ Stream: `{r['link']}`\n  🖼️ Embed: `{r['embed_link']}`\n  ⬇️ Download: `{r['dl_link']}`"
                 for r in sorted(results, key=lambda x: quality_sort_key(x["quality"]), reverse=True)
             ])
             await msg.reply_text(f"🎉 *Teeno Quality Secured & Saved!*\n\n🎌 *Anime:* `{setup['slug']}`\n{quality_lines}", parse_mode="Markdown")
+            await send_details(msg, storage_msg_id, ext)  # aakhri (3rd) video ki details
         except Exception as e:
             logger.error(f"handle_media error: {e}")
             try:
@@ -716,21 +785,12 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             forwarded = await copy_with_floodwait(context, chat_id=STORAGE_CHANNEL, from_chat_id=msg.chat_id, message_id=msg.message_id)
             storage_msg_id = forwarded.message_id
-            orig_ext = get_extension(filename, fallback="mp4")
-            fixed = await ensure_compatible(
-                processing, storage_msg_id, filename, orig_ext,
-                file_obj.file_size or 0, getattr(file_obj, "mime_type", "") or "",
-            )
-            storage_msg_id = fixed["sid"]
-            if fixed["ext"] != orig_ext:
-                filename = os.path.splitext(filename)[0] + "." + fixed["ext"]
             stream_link = make_stream_link(storage_msg_id, filename)
             download_link = make_download_link(storage_msg_id, filename)
             embed_link = make_embed_link(storage_msg_id, filename)
             await processing.delete()
             await msg.reply_text(
-                f"▶️ *Stream Link:*\n`{stream_link}`\n\n🖼️ *Embed Link:*\n`{embed_link}`\n\n⬇️ *Download Link:*\n`{download_link}`"
-                + (f"\n\n{fixed['note']}" if fixed["note"] else ""),
+                f"▶️ *Stream Link:*\n`{stream_link}`\n\n🖼️ *Embed Link:*\n`{embed_link}`\n\n⬇️ *Download Link:*\n`{download_link}`",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("▶️ Stream", url=stream_link)],
@@ -738,6 +798,7 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     [InlineKeyboardButton("⬇️ Download", url=download_link)],
                 ]),
             )
+            await send_details(msg, storage_msg_id, get_extension(filename, fallback="mp4"))
         except Exception as e:
             logger.error(f"handle_media error: {e}")
             try:
@@ -972,7 +1033,7 @@ async def stream_file(msg_id: int, filename: str, code: str, request: Request, d
 # ── MAIN RUNNER ───────────────────────────────────────
  
 async def run_bot():
-    app = Application.builder().token(BOT_TOKEN).concurrent_updates(True).build()
+    app = Application.builder().token(BOT_TOKEN).build()
     await app.bot.delete_webhook(drop_pending_updates=True)
     app.add_handler(CommandHandler("start",       start))
     app.add_handler(CommandHandler("setup",       setup_cmd))
