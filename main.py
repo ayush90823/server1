@@ -989,7 +989,7 @@ async def run_bot():
  
 async def run_server():
     config = uvicorn.Config(web_app, host="0.0.0.0", port=PORT, log_level="info")
-    server = uvicorn.Server(config)
+    server = uvicorn.Server(conffig)
     await server.serve()
  
  
