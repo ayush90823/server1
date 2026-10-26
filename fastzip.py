@@ -34,6 +34,10 @@ class ZipCancelled(Exception):
     pass
 
 
+class ShortSegment(Exception):
+    """Telegram ne expected se kam (ya 0) bytes diye."""
+
+
 # ── formatting helpers ────────────────────────────────
 
 def human_size(n: int) -> str:
@@ -250,11 +254,15 @@ class ZipProgress:
 def make_robust_fetch(raw_fetch: Callable[..., Awaitable[bytes]], prog: Optional[ZipProgress] = None):
     """raw_fetch(fid, idx, n) -> bytes ko timeout + backoff retry ke saath wrap karta hai."""
 
-    async def fetch(fid, idx: int, n: int) -> bytes:
+    async def fetch(fid, idx: int, n: int, expected: int = 0) -> bytes:
         last = None
         for attempt in range(SEG_RETRIES):
             try:
-                return await asyncio.wait_for(raw_fetch(fid, idx, n), timeout=SEG_TIMEOUT)
+                data = await asyncio.wait_for(raw_fetch(fid, idx, n), timeout=SEG_TIMEOUT)
+                # khaali / adhura data bhi failure hai -> retry (pehle ye seedha "chhota aaya" error banta tha)
+                if expected and len(data) < expected:
+                    raise ShortSegment(f"{len(data)}/{expected} bytes")
+                return data
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -312,7 +320,9 @@ async def build_zip_part(fetch, job: dict, prog: ZipProgress, p_no: int, vids: l
             if nxt is None:
                 return
             vi, idx, n = nxt
-            tasks.append((nxt, asyncio.create_task(fetch(vids[vi]["fid"], idx, n))))
+            vsize = int(vids[vi].get("size") or 0)
+            exp = max(min(n * CHUNK, vsize - idx * CHUNK), 0)
+            tasks.append((nxt, asyncio.create_task(fetch(vids[vi]["fid"], idx, n, exp))))
 
     async def close_current():
         nonlocal dest, pending_write
