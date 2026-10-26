@@ -733,6 +733,36 @@ async def cancel_zip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🛑 ZIP cancel/clear ho gaya." if had else "ℹ️ Koi zip session active nahi hai.")
  
  
+_collect_tasks: dict = {}
+
+
+async def _collect_status_loop(bot, chat_id: int, uid: int):
+    """Ek hi updater per user: bahut saare video ek saath aaye to bhi count/size hamesha LATEST dikhe."""
+    try:
+        while True:
+            sess = zip_session.get(uid)
+            if not sess:
+                return
+            sess["dirty"] = False
+            count = len(sess["videos"])
+            total = sum(v.get("size", 0) for v in sess["videos"])
+            text = f"📥 {count} video collected • {human_size(total)}\nSab bhej do to /done likho."
+            try:
+                if not sess.get("status_msg_id"):
+                    m = await bot.send_message(chat_id, text)
+                    sess["status_msg_id"] = m.message_id
+                else:
+                    await bot.edit_message_text(chat_id=chat_id, message_id=sess["status_msg_id"], text=text)
+            except Exception as e:
+                if "not modified" not in str(e).lower():
+                    logger.warning(f"collect status edit: {e}")
+            await asyncio.sleep(1.5)
+            if not sess.get("dirty"):
+                return
+    finally:
+        _collect_tasks.pop(uid, None)
+
+
 async def collect_zip_video(update: Update, context: ContextTypes.DEFAULT_TYPE, file_obj, raw_name: str, ep_num):
     msg = update.message
     uid = update.effective_user.id
@@ -758,25 +788,9 @@ async def collect_zip_video(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         "ext"  : ext,
         "n"    : len(sess["videos"]),
     })
-    count = len(sess["videos"])
-    total = sum(v["size"] for v in sess["videos"])
-    text = f"📥 {count} video collected • {human_size(total)}\nSab bhej do to /done likho."
- 
-    now = time.time()
-    if not sess.get("status_msg_id"):
-        sess["status_msg_id"] = -1          # concurrent updates me do status message na bane
-        try:
-            m = await msg.reply_text(text)
-            sess["status_msg_id"] = m.message_id
-        except Exception:
-            sess["status_msg_id"] = None
-        sess["last_edit"] = now
-    elif sess["status_msg_id"] > 0 and now - sess.get("last_edit", 0) >= 2:
-        try:
-            await context.bot.edit_message_text(chat_id=msg.chat_id, message_id=sess["status_msg_id"], text=text)
-        except Exception:
-            pass
-        sess["last_edit"] = now
+    sess["dirty"] = True
+    if uid not in _collect_tasks:
+        _collect_tasks[uid] = asyncio.create_task(_collect_status_loop(context.bot, msg.chat_id, uid))
     await save_state_to_firebase()
  
  
