@@ -1,10 +1,20 @@
 name: run-bot
 on:
   workflow_dispatch:
+  # Safety-net: agar bot kisi wajah se band ho jaye (crash / GitHub ne kill kiya) to ye naya run line me laga deta hai.
+  # Concurrency group ki wajah se ye tabhi shuru hota hai jab purana run khatam ho — dono ek saath nahi chalte.
+  schedule:
+    - cron: "*/20 * * * *"
 
+permissions:
+  contents: read
+  actions: write        # bot GitHub 6h limit se pehle khud naya run dispatch kar sake (GITHUB_TOKEN se)
+
+# cancel-in-progress: false  -> naya run PENDING rehta hai, chal rahe bot ko beech me kill nahi karta.
+# (Pehle true tha: naya run aate hi purana turant kat jata tha aur chalta ZIP job toot jata tha.)
 concurrency:
   group: bot
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   run:
@@ -15,6 +25,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
       - run: pip install -r requirements.txt
       - name: Install ffmpeg (video details ke liye)
         run: |
@@ -32,8 +43,22 @@ jobs:
           done
           [ -z "$URL" ] && { echo "Tunnel URL nahi mila"; cat tunnel.log; exit 1; }
           echo "ORIGIN_URL=$URL" >> $GITHUB_ENV
-      - name: Run bot
-        run: python main.py
+          # auto-restart scheduler ka clock: run start time (bot crash-restart par reset nahi hoga)
+          echo "RUN_STARTED_AT=$(date +%s)" >> $GITHUB_ENV
+      - name: Run bot (crash par same run me auto-restart)
+        run: |
+          set +e
+          for i in $(seq 1 20); do
+            python main.py
+            code=$?
+            if [ $code -eq 0 ]; then
+              echo "Bot gracefully band hua (handover / normal exit)."
+              exit 0
+            fi
+            echo "Bot crash (exit $code) — 5s me dobara chala raha hoon ($i/20)"
+            sleep 5
+          done
+          exit 1
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           API_ID: ${{ secrets.API_ID }}
@@ -44,5 +69,11 @@ jobs:
           FIREBASE_URL: ${{ secrets.FIREBASE_URL }}
           BASE_URL: https://proud-moon-7329.ayushkum099766.workers.dev
           PORT: "8000"
-
-          
+          # ── auto-restart scheduler ──
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_PAT: ${{ secrets.GH_PAT }}          # optional: GITHUB_TOKEN se dispatch na ho to PAT (actions:write) daalo
+          RESTART_AFTER_MIN: "325"               # itne min baad handover shuru (timeout-minutes 350 se pehle)
+          HARD_EXIT_MIN: "343"                   # chal rahe ZIP job ko itne min tak khatam hone ka time
+          # ── speed settings (GitHub runner: 7GB RAM) ──
+          ZIP_WORKERS: "10"
+          PYRO_TRANSMISSIONS: "12"
