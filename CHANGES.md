@@ -1,0 +1,32 @@
+# Kya badla (server1 upgrade)
+
+## Files
+- `statuskit.py`  – atakne wala nahi, heartbeat progress message
+- `fastzip.py`    – parallel ZIP engine + dashboard
+- `taskqueue.py`  – heavy task queue (Firebase me persist)
+- `autorestart.py`– GitHub 6h limit se pehle self-restart
+- `main.py`, `.github/workflows/main.yml` – inhe use karne ke liye update
+
+## Commands (naye)
+- `/queue`      – heavy queue dekho
+- `/status`     – uptime, agla auto-restart, queue count
+- `/restartnow` – manual handover (sirf ALLOWED_USERS)
+- `/done`       – ab ZIP ko queue me daalta hai; turant naya `/zip` ya koi chhota kaam kar sakte ho
+
+## Settings (env, sab optional)
+| Name | Default | Matlab |
+|---|---|---|
+| ZIP_WORKERS | 10 | parallel tukde (speed) |
+| ZIP_SEG_CHUNKS | 2 | 1 tukda = N x 1MB |
+| PYRO_TRANSMISSIONS | 12 | Pyrogram parallel limit (low-RAM host par 4) |
+| HEAVY_WORKERS | 1 | ek saath kitne heavy job |
+| RESTART_AFTER_MIN | 325 | itne min baad handover shuru |
+| HARD_EXIT_MIN | 343 | chal rahe job ko is time tak deadline |
+| AUTO_RESTART | 1 | 0 = band |
+| DROP_PENDING_UPDATES | 0 | 1 = start par purane messages drop |
+
+## GitHub me ek baar check karo
+Settings -> Actions -> General -> Workflow permissions = "Read and write permissions".
+Agar auto-dispatch fail ho (log me `dispatch HTTP 403`), to ek Personal Access Token
+(actions:write) banao aur repo secret `GH_PAT` me daalo.
+Cron safety-net tab bhi bot ko 20 min ke andar wapas utha dega.
