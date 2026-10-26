@@ -30,3 +30,9 @@ Settings -> Actions -> General -> Workflow permissions = "Read and write permiss
 Agar auto-dispatch fail ho (log me `dispatch HTTP 403`), to ek Personal Access Token
 (actions:write) banao aur repo secret `GH_PAT` me daalo.
 Cron safety-net tab bhi bot ko 20 min ke andar wapas utha dega.
+
+## Fix: "segment 0 chhota aaya (0/...)" (ZIP error)
+- `fastzip.py`: Telegram se khaali/adhura segment aaye to ab retry hota hai (pehle seedha error aata tha). `ShortSegment` add hua.
+- `main.py`: ZIP ke liye video ka chat_id/message_id save hota hai; zip banate waqt fresh Message (get_messages) se download hota hai,
+  taaki expire hua file_id/file_reference problem na kare. Khaali aaye to Message refresh karke dobara try.
+- Purane collected videos (jinme cid/mid nahi) file_id se hi chalenge. Pakka fix ke liye unhe dobara bhejna behtar hai.
