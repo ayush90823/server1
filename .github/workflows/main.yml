@@ -44,3 +44,4 @@ jobs:
           FIREBASE_URL: ${{ secrets.FIREBASE_URL }}
           BASE_URL: https://proud-moon-7329.ayushkum099766.workers.dev
           PORT: "8000"
+          
