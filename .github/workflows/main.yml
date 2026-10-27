@@ -33,7 +33,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ~/ffbin
-          key: ffprobe-btbn-v1
+          key: ffprobe-btbn-v2
       - name: Download static ffprobe (cache miss par)
         if: steps.ffcache.outputs.cache-hit != 'true'
         id: ffdl
@@ -43,7 +43,8 @@ jobs:
           mkdir -p ~/ffbin
           curl -fsSL --retry 3 --connect-timeout 15 --max-time 150 -o /tmp/ff.tar.xz \
             https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz \
-            && tar -xJf /tmp/ff.tar.xz --wildcards '*/bin/ffprobe' --strip-components=2 -C ~/ffbin \
+            && tar -xJf /tmp/ff.tar.xz -C ~/ffbin --strip-components=2 --wildcards '*/bin/ffprobe' \
+            && test -f ~/ffbin/ffprobe \
             && chmod +x ~/ffbin/ffprobe \
             || { echo "ffprobe download fail - bot bina video-details ke chalega"; rm -rf ~/ffbin; exit 1; }
           rm -f /tmp/ff.tar.xz
@@ -53,7 +54,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ~/ffbin
-          key: ffprobe-btbn-v1
+          key: ffprobe-btbn-v2
       - name: Add ffprobe to PATH
         continue-on-error: true
         run: |
