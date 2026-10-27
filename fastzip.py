@@ -340,7 +340,15 @@ async def build_zip_part(fetch, job: dict, prog: ZipProgress, p_no: int, vids: l
         refill()
         while tasks:
             (vi, idx, n), t = tasks.popleft()
-            data = await t
+            tasks.appendleft(((vi, idx, n), t))     # cancel par finally ise bhi cancel kare
+            while True:                              # /cancelzip 0.5s me pakde (atke hue tukde ka intezaar nahi)
+                done, _ = await asyncio.wait({t}, timeout=0.5)
+                if done:
+                    break
+                if job.get("cancel"):
+                    raise ZipCancelled()
+            tasks.popleft()
+            data = t.result()
             refill()
             if job.get("cancel"):
                 raise ZipCancelled()
@@ -370,8 +378,8 @@ async def build_zip_part(fetch, job: dict, prog: ZipProgress, p_no: int, vids: l
     finally:
         for _, t in tasks:
             t.cancel()
-        if tasks:
-            await asyncio.gather(*[t for _, t in tasks], return_exceptions=True)
+        if tasks:    # atke hue task ke liye zyada nahi ruko (cancel turant dikhe)
+            await asyncio.wait([t for _, t in tasks], timeout=5)
         if pending_write is not None:
             try:
                 await pending_write
