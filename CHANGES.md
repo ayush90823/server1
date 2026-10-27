@@ -36,3 +36,8 @@ Cron safety-net tab bhi bot ko 20 min ke andar wapas utha dega.
 - `main.py`: ZIP ke liye video ka chat_id/message_id save hota hai; zip banate waqt fresh Message (get_messages) se download hota hai,
   taaki expire hua file_id/file_reference problem na kare. Khaali aaye to Message refresh karke dobara try.
 - Purane collected videos (jinme cid/mid nahi) file_id se hi chalenge. Pakka fix ke liye unhe dobara bhejna behtar hai.
+
+## Fix: "Telegram se data nahi aa raha (segment N): TimeoutError"
+- Wajah: pyrofork har fetch par naya Telegram connection (+ ExportAuthorization) banata hai. 2MB tukde x 10 parallel = bahut saare connection, Telegram throttle karke atka deta hai.
+- Ab default: `ZIP_SEG_CHUNKS=8` (8MB/tukda), `ZIP_WORKERS=4`; retries 8, timeout 90s. `main.yml` me bhi yahi values.
+- Agar GitHub secrets/variables ya host env me `ZIP_WORKERS=10` ya `ZIP_SEG_CHUNKS=2` set hai to use hata do/badlo.
