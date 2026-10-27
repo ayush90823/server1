@@ -28,9 +28,20 @@ jobs:
           cache: pip
       - run: pip install -r requirements.txt
       - name: Install ffmpeg (video details ke liye)
+        # ffprobe sirf video details ke liye hai. Install atke/fail ho to bhi bot chalega (main.py bina ffprobe ke chalta hai).
+        continue-on-error: true
+        timeout-minutes: 5
+        env:
+          DEBIAN_FRONTEND: noninteractive
         run: |
-          which ffprobe || (sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg)
-          ffprobe -version | head -1
+          if which ffprobe; then
+            echo "ffprobe pehle se installed hai"
+          else
+            echo "ffmpeg install ho raha hai..."
+            sudo timeout 120 apt-get update -o Acquire::Retries=3 -o Acquire::http::Timeout=20 || echo "apt update fail/timeout"
+            sudo timeout 240 apt-get install -y --no-install-recommends -o Acquire::Retries=3 -o Acquire::http::Timeout=20 ffmpeg || echo "ffmpeg install fail/timeout - video details band rahengi"
+          fi
+          ffprobe -version | head -1 || echo "ffprobe nahi mila (bot phir bhi chalega)"
       - name: Start Cloudflare quick tunnel
         run: |
           curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
