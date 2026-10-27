@@ -26,8 +26,8 @@ from typing import Awaitable, Callable, List, Optional
 logger = logging.getLogger(__name__)
 
 CHUNK = 1024 * 1024          # Telegram stream_media ka 1 chunk = 1MB
-SEG_TIMEOUT = 75             # ek tukde ka max time (isse zyada -> retry)
-SEG_RETRIES = 6
+SEG_TIMEOUT = 90             # ek tukde ka max time (isse zyada -> retry)
+SEG_RETRIES = 8
 
 
 class ZipCancelled(Exception):
@@ -267,16 +267,16 @@ def make_robust_fetch(raw_fetch: Callable[..., Awaitable[bytes]], prog: Optional
                 raise
             except Exception as e:
                 last = e
-                wait = min(2 ** attempt, 20)
+                wait = min(2 ** attempt, 15)
                 fw = getattr(e, "value", None)
                 if isinstance(fw, (int, float)) and fw > 0:    # Telegram FloodWait: utna ruko
                     wait = max(wait, min(fw + 1, 120))
-                msg = f"Retry {attempt + 1}/{SEG_RETRIES}: {type(e).__name__}"
+                msg = f"Retry {attempt + 1}/{SEG_RETRIES}: {type(e).__name__ or repr(e)}"
                 logger.warning(f"segment {idx} fail ({msg}): {e!r} -> {wait}s")
                 if prog:
                     prog.set_note(msg)
                 await asyncio.sleep(wait)
-        raise RuntimeError(f"Telegram se data nahi aa raha (segment {idx}): {last!r}")
+        raise RuntimeError(f"Telegram se data nahi aa raha (segment {idx}): {type(last).__name__} {last}".strip())
 
     return fetch
 
