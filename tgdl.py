@@ -17,6 +17,7 @@ Agar kuch bhi is raste par unsupported ho to main.py purane stream_media wale ra
 
 import asyncio
 import logging
+import time
 from typing import List, Optional, Union
 
 from pyrogram import raw
@@ -28,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 CH = 1024 * 1024                 # Telegram GetFile ka 1 chunk
 REQ_TIMEOUT = 20                 # ek chunk ka jawab itni der me na aaye -> session kharab maano
-SESSION_START_TIMEOUT = 25
+SESSION_START_TIMEOUT = 20
 MEDIA_KINDS = ("audio", "document", "photo", "sticker", "animation", "video", "voice", "video_note")
 
 
@@ -57,6 +58,15 @@ class MediaPool:
         self.size = max(1, int(size))
         self._dc: dict = {}
         self._lock = asyncio.Lock()
+        self.on_note = None            # callable(str) — status me dikhane ke liye (kahan atka)
+
+    def _note(self, msg: str):
+        logger.info(f"tgdl: {msg}")
+        if self.on_note:
+            try:
+                self.on_note(msg)
+            except Exception:
+                pass
 
     # ── DC state (auth key ek baar) ─────────────────
     async def _dc_state(self, dc_id: int) -> dict:
@@ -73,7 +83,10 @@ class MediaPool:
                 auth_key = await self.client.storage.auth_key()
                 needs_import = False
             else:
-                auth_key = await asyncio.wait_for(Auth(self.client, dc_id, test_mode).create(), 60)
+                self._note(f"DC{dc_id} ki auth key ban rahi hai…")
+                t0 = time.time()
+                auth_key = await asyncio.wait_for(Auth(self.client, dc_id, test_mode).create(), 40)
+                self._note(f"DC{dc_id} auth key ready ({time.time() - t0:.1f}s)")
                 needs_import = True
             st = {
                 "auth_key": auth_key, "test_mode": test_mode, "needs_import": needs_import, "imported": False,
@@ -91,9 +104,13 @@ class MediaPool:
     async def _make_session(self, st: dict, dc_id: int) -> Session:
         async with st["create_lock"]:              # pehla session import karta hai, baaki uske baad
             s = Session(self.client, dc_id, st["auth_key"], st["test_mode"], is_media=True)
+            t0 = time.time()
+            self._note(f"DC{dc_id} connection khul raha hai…")
             try:
                 await asyncio.wait_for(s.start(), SESSION_START_TIMEOUT)
+                self._note(f"DC{dc_id} connection ready ({time.time() - t0:.1f}s)")
                 if st["needs_import"] and not st["imported"]:
+                    self._note("Telegram login transfer (ImportAuthorization)…")
                     exported = await self.client.invoke(raw.functions.auth.ExportAuthorization(dc_id=dc_id))
                     await s.invoke(
                         raw.functions.auth.ImportAuthorization(id=exported.id, bytes=exported.bytes),
@@ -202,4 +219,5 @@ async def fetch_segment(pool: MediaPool, src, seg_offset: int, n_chunks: int, ma
         if resumes > max_resumes:
             raise last if last else RuntimeError("tgdl resume limit")
         logger.warning(f"tgdl resume {resumes}/{max_resumes} @chunk {seg_offset + len(parts)}: {type(last).__name__} {last}")
+        pool._note(f"Retry {resumes}/{max_resumes}: {type(last).__name__} {last}"[:120])
     return b"".join(parts)
