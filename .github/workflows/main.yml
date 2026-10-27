@@ -27,21 +27,42 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: pip install -r requirements.txt
-      - name: Install ffmpeg (video details ke liye)
-        # ffprobe sirf video details ke liye hai. Install atke/fail ho to bhi bot chalega (main.py bina ffprobe ke chalta hai).
+      # ffprobe sirf video details ke liye hai. apt-get ffmpeg 4 min leta tha -> static ffprobe (GitHub se ~10s) + cache.
+      - name: Restore ffprobe cache
+        id: ffcache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/ffbin
+          key: ffprobe-btbn-v1
+      - name: Download static ffprobe (cache miss par)
+        if: steps.ffcache.outputs.cache-hit != 'true'
+        id: ffdl
         continue-on-error: true
-        timeout-minutes: 5
-        env:
-          DEBIAN_FRONTEND: noninteractive
+        timeout-minutes: 3
         run: |
-          if which ffprobe; then
-            echo "ffprobe pehle se installed hai"
+          mkdir -p ~/ffbin
+          curl -fsSL --retry 3 --connect-timeout 15 --max-time 150 -o /tmp/ff.tar.xz \
+            https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz \
+            && tar -xJf /tmp/ff.tar.xz --wildcards '*/bin/ffprobe' --strip-components=2 -C ~/ffbin \
+            && chmod +x ~/ffbin/ffprobe \
+            || { echo "ffprobe download fail - bot bina video-details ke chalega"; rm -rf ~/ffbin; exit 1; }
+          rm -f /tmp/ff.tar.xz
+      - name: Save ffprobe cache
+        if: steps.ffcache.outputs.cache-hit != 'true' && steps.ffdl.outcome == 'success'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ~/ffbin
+          key: ffprobe-btbn-v1
+      - name: Add ffprobe to PATH
+        continue-on-error: true
+        run: |
+          if [ -x "$HOME/ffbin/ffprobe" ]; then
+            echo "$HOME/ffbin" >> "$GITHUB_PATH"
+            "$HOME/ffbin/ffprobe" -version | head -1
           else
-            echo "ffmpeg install ho raha hai..."
-            sudo timeout 120 apt-get update -o Acquire::Retries=3 -o Acquire::http::Timeout=20 || echo "apt update fail/timeout"
-            sudo timeout 240 apt-get install -y --no-install-recommends -o Acquire::Retries=3 -o Acquire::http::Timeout=20 ffmpeg || echo "ffmpeg install fail/timeout - video details band rahengi"
+            echo "ffprobe nahi mila (bot phir bhi chalega)"
           fi
-          ffprobe -version | head -1 || echo "ffprobe nahi mila (bot phir bhi chalega)"
       - name: Start Cloudflare quick tunnel
         run: |
           curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
@@ -86,6 +107,6 @@ jobs:
           RESTART_AFTER_MIN: "325"               # itne min baad handover shuru (timeout-minutes 350 se pehle)
           HARD_EXIT_MIN: "343"                   # chal rahe ZIP job ko itne min tak khatam hone ka time
           # ── speed settings (GitHub runner: 7GB RAM) ──
-          ZIP_WORKERS: "4"
+          ZIP_WORKERS: "6"
           ZIP_SEG_CHUNKS: "8"
           PYRO_TRANSMISSIONS: "12"
