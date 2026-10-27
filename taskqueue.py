@@ -87,6 +87,23 @@ class HeavyQueue:
             self._changed()
         return gone
 
+    def drop_user(self, uid: Optional[int] = None) -> List[Job]:
+        """LINE ke aur CHAL RAHE jobs hata do (uid=None -> sabke). Chal raha job 'dropped' mark hota hai:
+        use snapshot (Firebase) me nahi rakhte, taaki bot restart par wo wapas line me na aaye."""
+        gone = []
+        for j in list(self.running.values()):
+            if uid is None or j.uid == uid:
+                j.dropped = True
+                gone.append(j)
+        q = [j for j in self.queued if uid is None or j.uid == uid]
+        if q:
+            self.queued = [j for j in self.queued if j not in q]
+            gone += q
+        if gone:
+            self._refresh_idle()
+            self._changed()
+        return gone
+
     def user_jobs(self, uid: int) -> List[Job]:
         return [j for j in list(self.running.values()) + self.queued if j.uid == uid]
 
@@ -94,7 +111,7 @@ class HeavyQueue:
         """Persist karne ke liye: running + queued (restart ke baad sab dobara line me)."""
         if self._frozen is not None:
             return self._frozen
-        return [j.to_dict() for j in list(self.running.values()) + self.queued]
+        return [j.to_dict() for j in list(self.running.values()) + self.queued if not getattr(j, "dropped", False)]
 
     def restore(self, items: List[dict]) -> int:
         n = 0
