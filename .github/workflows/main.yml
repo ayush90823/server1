@@ -75,5 +75,6 @@ jobs:
           RESTART_AFTER_MIN: "325"               # itne min baad handover shuru (timeout-minutes 350 se pehle)
           HARD_EXIT_MIN: "343"                   # chal rahe ZIP job ko itne min tak khatam hone ka time
           # ── speed settings (GitHub runner: 7GB RAM) ──
-          ZIP_WORKERS: "10"
+          ZIP_WORKERS: "4"
+          ZIP_SEG_CHUNKS: "8"
           PYRO_TRANSMISSIONS: "12"
