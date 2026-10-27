@@ -26,7 +26,7 @@ from typing import Awaitable, Callable, List, Optional
 logger = logging.getLogger(__name__)
 
 CHUNK = 1024 * 1024          # Telegram stream_media ka 1 chunk = 1MB
-SEG_TIMEOUT = 90             # ek tukde ka max time (isse zyada -> retry)
+SEG_TIMEOUT = 240            # ek tukde ka max time (isse zyada -> retry)
 SEG_RETRIES = 8
 
 
